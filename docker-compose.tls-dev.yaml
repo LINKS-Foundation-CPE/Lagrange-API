@@ -1,0 +1,20 @@
+# DEV-only compose overlay — apply EXPLICITLY (never auto-merged):
+#   docker compose -f docker-compose.yaml -f docker-compose.tls-dev.yaml up -d
+# Mounts the shared self-signed dev certificate (see keycloak-deployment repo)
+# so the API can serve HTTPS natively via SSL_CERT / SSL_KEY in .env, and lets
+# the API validate Keycloak JWTs against a self-signed Keycloak running on the
+# host: host.docker.internal is reachable (host-gateway) and is a SAN on the
+# shared dev cert, and NODE_EXTRA_CA_CERTS makes Node trust that cert. Point
+# KEYCLOAK_BASE_URL at https://host.docker.internal:8843/auth in .env.
+services:
+  quantum-api:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      NODE_EXTRA_CA_CERTS: /certs/keycloak.crt
+    volumes:
+      # Configurable, because the certificate the dev stack actually presents
+      # moved into the portable-deployment tree at the 2026-07-21 rebuild while
+      # ../keycloak-deployment/certs kept a stale copy. Set KEYCLOAK_CERT_PATH in
+      # .env to the directory whose cert the TLS endpoints really serve.
+      - ${KEYCLOAK_CERT_PATH:-../keycloak-deployment/certs}:/certs:ro

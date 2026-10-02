@@ -1,0 +1,1770 @@
+openapi: 3.1.1
+info:
+  title: quantum-api
+  description: |
+    Backend API for the LINKS quantum-computer management stack: organizations,
+    projects and budgets, pre-allocated slots and reservations, job records and
+    billing. Consumed by the QC Gateway (`/jobAuthorizer`, `/jobReport`), by the
+    quantum-dashboard (react-admin), and by end users via the backend token.
+
+    ### Authentication
+    Two token types are used (see the security schemes):
+    * **KeycloakJWT** — an OIDC access token from the configured Keycloak realm.
+      Used only on `POST /auth/token` and `POST /jobAuthorizer`.
+    * **BackendJWT** — the platform token returned by `POST /auth/token`.
+      Required by every `/api/*` route.
+
+    ### Pagination, sorting, filtering (react-admin "simple REST" convention)
+    List endpoints accept `range` (`[start, end]`, inclusive), `sort`
+    (`["field", "ASC"|"DESC"]`) and `filter` (JSON object; suffixes
+    `_gte/_lte/_gt/_lt/_ne` supported) query parameters, and return the total
+    count in the `Content-Range` response header.
+
+    ### Deployment policy flags (environment variables)
+    * `SLOT_CONSTRAINED_RESERVATIONS` (default `true`) — reservations must be
+      placed inside a pre-allocated slot of the project's organization. When
+      `false`, `slot_id` is optional on reservation creation and reservations
+      can be placed freely.
+    * `ALLOW_FOREIGN_ORG_QUEUE_IN_SLOTS` (default `true`) — during another
+      organization's slot (outside reservations) the open queue stays available
+      to everyone. When `false`, job authorization is restricted to the slot's
+      organization and organizations referencing it.
+  version: 1.1.0
+  license:
+    name: EUPL-1.2
+
+servers:
+  - url: /
+
+tags:
+  - name: Auth
+  - name: Gateway
+    description: >-
+      Endpoints consumed by the QC Gateway. These are **internal by deployment,
+      not by authentication**: `/jobReport` and `/userRoles` carry no credential
+      and `/jobAuthorizer` verifies the submitting user's token rather than a
+      calling service identity. Restrict them to the gateway's address at the
+      reverse proxy — `POST`/`PUT /jobReport` drive billing.
+  - name: Users
+  - name: Own
+    description: Self-service endpoints for the authenticated user
+  - name: Organizations
+  - name: Projects
+  - name: Slots
+    description: Pre-allocated machine-time windows owned by organizations
+  - name: Reservations
+  - name: Jobs
+  - name: Budget events
+  - name: Announcements
+  - name: Notifications
+  - name: Logs
+  - name: Metrics
+
+components:
+  securitySchemes:
+    BackendJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Platform token from `POST /auth/token`
+    KeycloakJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: OIDC access token from the configured Keycloak realm
+
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    range:
+      name: range
+      in: query
+      required: false
+      description: 'Pagination as `[start, end]` (inclusive), e.g. `[0,24]`'
+      schema: { type: string }
+    sort:
+      name: sort
+      in: query
+      required: false
+      description: 'Sorting as `["field","ASC"|"DESC"]`'
+      schema: { type: string }
+    filter:
+      name: filter
+      in: query
+      required: false
+      description: 'JSON filter object; `_gte/_lte/_gt/_lt/_ne` suffixes supported'
+      schema: { type: string }
+    reportFrom:
+      name: from
+      in: query
+      required: true
+      description: >-
+        Start of the period, inclusive. A bare date (`2026-01-01`) is read as
+        midnight UTC of that day.
+      schema: { type: string, example: '2026-01-01' }
+    reportTo:
+      name: to
+      in: query
+      required: true
+      description: >-
+        End of the period, inclusive. A bare date is midnight UTC of that day,
+        so `to=2026-12-31` ends at the *start* of the 31st. Rows are counted
+        only when they lie entirely within the period.
+      schema: { type: string, example: '2027-01-01' }
+    reportGroupBy:
+      name: group_by
+      in: query
+      required: false
+      description: Row granularity. Organizations are reached through the project.
+      schema: { type: string, enum: [project, organization], default: project }
+
+  headers:
+    Content-Range:
+      description: 'Total count for paginated lists, e.g. `items 0-24/310`'
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Tag:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+    ReportRow:
+      type: object
+      description: >-
+        One row of a billing report. `id` is the grouping key, so react-admin
+        can consume the report like any other list. When grouped by
+        organization the project fields are null.
+      properties:
+        id: { type: integer }
+        project_id: { type: integer, nullable: true }
+        project_name: { type: string, nullable: true }
+        free_queue:
+          type: boolean
+          nullable: true
+          description: Informational only — it never filters a report.
+        organization_id: { type: integer, nullable: true }
+        organization_name: { type: string, nullable: true }
+        count: { type: integer, description: Rows counted (jobs, reservations or slots) }
+        total_seconds: { type: number }
+        total_hours: { type: number }
+    UtilizationReportRow:
+      allOf:
+        - $ref: '#/components/schemas/ReportRow'
+        - type: object
+          properties:
+            usage_hours: { type: number, description: Execution inside the reserved blocks }
+            reserved_hours: { type: number }
+            utilization:
+              type: number
+              nullable: true
+              description: usage ÷ reserved, or null when nothing was reserved.
+    ReportSummary:
+      type: object
+      properties:
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time }
+        reservations:
+          type: object
+          properties:
+            by_project: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+            by_organization: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+        jobs:
+          type: object
+          properties:
+            by_project: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+            by_organization: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+        slots:
+          type: object
+          properties:
+            by_organization: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+        utilization:
+          type: object
+          properties:
+            by_project: { type: array, items: { $ref: '#/components/schemas/UtilizationReportRow' } }
+    Error:
+      type: object
+      properties:
+        message: { type: string }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        email:
+          type: string
+          description: >-
+            The user identity, reported as `username` by the QC Gateway. Must be
+            an e-mail address unless the deployment was initialised with
+            `USERNAME_FORMAT=any` (frozen at first boot), which admits any
+            whitespace-free string.
+        sub:
+          type: [string, 'null']
+          description: Keycloak subject, back-filled on first login
+        organization_id: { type: [integer, 'null'] }
+        default_project_id: { type: [integer, 'null'] }
+        organization_manager: { type: boolean }
+        organization_auditor: { type: boolean }
+        pulla_user:
+          type: boolean
+          description: >-
+            Pulse access — sweep submission. Settable by administrators and
+            mirrored from the identity provider at login; reported by
+            `GET /userRoles/{username}`.
+
+    Organization:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        name: { type: string }
+        reference_organization_id:
+          type: [integer, 'null']
+          description: Parent/reference organization (shares slot access)
+        vault_project_id:
+          type: [integer, 'null']
+          readOnly: true
+          description: Project holding the organization's unallocated budget
+
+    OrganizationCreate:
+      type: object
+      required: [name, free_queue]
+      properties:
+        name: { type: string, minLength: 3 }
+        reference_organization_id: { type: [integer, 'null'] }
+        free_queue: { type: boolean }
+        initial_budget:
+          type: [integer, 'null']
+          description: Initial vault budget in **hours**
+
+    Project:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        name: { type: string }
+        remaining_budget:
+          type: string
+          description: Remaining budget in QPU **milliseconds** (BIGINT as string)
+        start_at: { type: [string, 'null'], format: date-time }
+        end_at: { type: [string, 'null'], format: date-time }
+        free_queue: { type: boolean }
+        organization_id: { type: integer }
+
+    ProjectCreate:
+      type: object
+      required: [name, organization_id]
+      properties:
+        name: { type: string, minLength: 3 }
+        organization_id: { type: integer }
+        budget:
+          type: number
+          description: >-
+            Initial budget in QPU **milliseconds**, drawn from the organization
+            vault. Note the asymmetry with `OrganizationCreate.initial_budget`,
+            which is in hours.
+        start_at: { type: [string, 'null'], format: date }
+        end_at: { type: [string, 'null'], format: date }
+        free_queue: { type: boolean }
+
+    Slot:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        organization_id: { type: integer }
+        day: { type: string, format: date }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        series_id:
+          type: [string, 'null']
+          format: uuid
+          readOnly: true
+          description: Shared by every slot created as one recurring series; null otherwise
+
+    Reservation:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        project_id: { type: integer }
+        made_by: { type: integer, readOnly: true }
+        slot_id:
+          type: [integer, 'null']
+          description: Containing slot; null when the deployment allows free placement
+        day: { type: string, format: date }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        description: { type: string }
+        series_id:
+          type: [string, 'null']
+          format: uuid
+          readOnly: true
+          description: Shared by every reservation created as one recurring series; null otherwise
+
+    Recurrence:
+      type: object
+      description: >
+        A weekly recurrence: these weekdays, this wall-clock time in `timezone`,
+        from one date to another inclusive. Wall-clock, not a UTC offset, so a
+        09:00 series stays 09:00 across daylight-saving changes. At most 366
+        occurrences; an occurrence cannot run past midnight.
+      required: [from, until, weekdays, start_time, end_time, timezone]
+      properties:
+        from: { type: string, format: date }
+        until: { type: string, format: date }
+        weekdays:
+          type: array
+          items: { type: integer, minimum: 1, maximum: 7 }
+          description: ISO weekdays, 1 = Monday … 7 = Sunday
+        start_time: { type: string, pattern: '^([01]\d|2[0-3]):(00|30)$', example: '09:00' }
+        end_time: { type: string, pattern: '^([01]\d|2[0-3]):(00|30)$', example: '12:00' }
+        timezone: { type: string, example: Europe/Rome }
+
+    SeriesResult:
+      type: object
+      description: >
+        What a series request did or would do. `outcome` is `preview` for a dry
+        run (200), `created` when the series was written (201), and `refused`
+        (409) when some occurrences conflict and `skip_conflicts` was not set,
+        when none can be created, or — for reservations — when the project
+        cannot pay. A refused request writes nothing.
+      properties:
+        outcome: { type: string, enum: [preview, created, refused] }
+        message: { type: string }
+        series_id: { type: [string, 'null'], format: uuid }
+        created: { type: array, items: { type: integer } }
+        occurrences:
+          type: array
+          items:
+            type: object
+            properties:
+              day: { type: string, format: date }
+              start: { type: string, format: date-time }
+              end: { type: string, format: date-time }
+              slot_id: { type: [integer, 'null'], description: 'Reservation series: the slot it goes in' }
+              problem: { type: [string, 'null'], description: Why it cannot be created; null if it can }
+        summary:
+          type: object
+          properties:
+            total: { type: integer }
+            ok: { type: integer }
+            conflicts: { type: integer }
+            cost_ms: { type: integer, description: Reservation series only }
+            remaining_budget_ms: { type: integer, description: Reservation series only }
+            budget_problem: { type: [string, 'null'], description: Reservation series only }
+
+    ReservationCreate:
+      type: object
+      required: [project_id, start, end]
+      properties:
+        project_id: { type: integer }
+        slot_id:
+          type: [integer, 'null']
+          description: Required when `SLOT_CONSTRAINED_RESERVATIONS=true` (default)
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+        description: { type: string }
+
+    Job:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        jobid: { type: string, description: Machine/gateway job id }
+        organization_id: { type: [integer, 'null'] }
+        project_id: { type: [integer, 'null'] }
+        user_id: { type: [integer, 'null'] }
+        status: { type: string }
+        job_type: { type: string }
+        execution_start: { type: [string, 'null'], format: date-time }
+        execution_end: { type: [string, 'null'], format: date-time }
+        submitted_datetime: { type: string, format: date-time }
+        submitted_circuit: { type: [string, 'null'], format: uri }
+        results: { type: [string, 'null'], format: uri }
+        usedReservation: { type: boolean }
+
+    JobReport:
+      type: object
+      required: [username, jobid, submitted_datetime]
+      properties:
+        username:
+          type: string
+          description: >-
+            The submitting user identity (matched against `users.email`). Must
+            be an e-mail address unless the deployment uses
+            `USERNAME_FORMAT=any`.
+        jobid: { type: string }
+        project_name: { type: [string, 'null'] }
+        status: { type: [string, 'null'] }
+        job_type: { type: [string, 'null'] }
+        execution_start: { type: [string, 'null'], format: date-time }
+        execution_end: { type: [string, 'null'], format: date-time }
+        submitted_datetime: { type: string, format: date-time }
+        submitted_circuit: { type: [string, 'null'], format: uri }
+        results: { type: [string, 'null'], format: uri }
+        billable:
+          type: [integer, 'null']
+          minimum: 0
+          description: >-
+            Amount to charge for this job, in whatever unit the deployment
+            bills in. Honoured **only** when the deployment sets
+            `ACCEPT_REPORTED_BILLING=true`, and only on the terminal
+            `PUT /jobReport/{jobid}` — the creating `POST` bills nothing, so
+            the field is ignored there. When accepted it replaces
+            `execution_end - execution_start` as the charge; it is subtracted
+            from `projects.remaining_budget` verbatim, so keeping the unit
+            consistent with the budgets is the operator's responsibility.
+            Reports without it still bill the execution window, so a
+            deployment can mix the two.
+
+    BudgetEvent:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        project_id: { type: integer }
+        value:
+          type: string
+          description: Signed amount in QPU milliseconds (BIGINT as string)
+        date: { type: string, format: date-time }
+        description: { type: string }
+        billing:
+          type: boolean
+          description: true = QPU billing/refund, false = administrative transfer
+        user_id:
+          type: integer
+          nullable: true
+          description: >-
+            Who the transaction is attributable to — the submitter for a job
+            charge, the acting user for a reservation charge or refund. Null
+            where no user caused it (a vault being funded, a project created
+            with a budget), and null for job charges predating the column that
+            the backfill could not resolve from the description.
+        user:
+          type: object
+          nullable: true
+          readOnly: true
+          description: >-
+            Included by `GET /api/projects/{id}/transactions` only, so the
+            ledger can show who without a lookup per row.
+          properties:
+            id: { type: integer }
+            email: { type: string }
+
+    Announcement:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        made_by: { type: integer, readOnly: true }
+        title: { type: string }
+        description: { type: string }
+        start: { type: string, format: date-time }
+        end: { type: string, format: date-time }
+
+    Notification:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        user_id: { type: integer }
+        timestamp: { type: string, format: date-time }
+        type: { type: string }
+        title: { type: string }
+        description: { type: string }
+        read: { type: boolean }
+
+    ActionLog:
+      type: object
+      properties:
+        id: { type: integer, readOnly: true }
+        timestamp: { type: string, format: date-time }
+        user_id: { type: [integer, 'null'] }
+        action: { type: string }
+        resource: { type: string }
+        resource_id: { type: [integer, 'null'] }
+        description: { type: string }
+
+security:
+  - BackendJWT: []
+
+paths:
+  /auth/token:
+    post:
+      tags: [Auth]
+      summary: Exchange a Keycloak token for a platform token
+      description: |
+        Validates the Keycloak access token, lazily provisions/reconciles the
+        user row (by `sub`, falling back to `email`), computes roles and signs
+        the platform JWT.
+      security: [{ KeycloakJWT: [] }]
+      responses:
+        '200':
+          description: Platform token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /jobAuthorizer:
+    post:
+      tags: [Gateway]
+      summary: Authorize a job submission
+      description: |
+        Called by the QC Gateway before forwarding a submission to the machine.
+        Resolves the user's project (explicit `project_name` → active
+        reservation → default project) and verifies the project window. An
+        active reservation admits only the reserving project; otherwise the
+        open queue admits the job if the project has `free_queue` or positive
+        budget. With `ALLOW_FOREIGN_ORG_QUEUE_IN_SLOTS=false`, the open queue
+        is additionally restricted to the active slot's organization.
+
+        **Pulse access.** When `job_type` names a privileged path — `sweep` for
+        the IQM vendor plugin — the caller must have `users.pulla_user`, or the
+        call is `403` before any project is resolved. That flag is the
+        platform's own record of the grant: mirrored from the identity provider
+        at login and settable by an administrator, so access can be granted to a
+        principal whose token carries no roles, and revoked without editing the
+        identity provider. A request carrying no `job_type` is treated as the
+        ordinary circuit path, so a gateway older than the field keeps working.
+      security: [{ KeycloakJWT: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  description: Informational; identity comes from the token
+                project_name: { type: [string, 'null'] }
+                job_type:
+                  type: string
+                  description: >-
+                    The vendor plugin's classification of the request —
+                    `circuit` or `sweep` for IQM. Optional; absent means the
+                    ordinary path.
+      responses:
+        '200': { description: Authorized }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /jobReport:
+    post:
+      tags: [Gateway]
+      summary: Record a submitted job
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JobReport' }
+      responses:
+        '200':
+          description: Job recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /jobReport/{jobid}:
+    put:
+      tags: [Gateway]
+      summary: Update a job to a terminal state (bills the job)
+      description: |
+        On completion with both execution timestamps, projects that are not
+        `free_queue` and jobs that did not run inside a reservation are billed
+        `execution_end - execution_start` milliseconds.
+
+        A deployment with `ACCEPT_REPORTED_BILLING=true` may instead send a
+        `billable` amount, which is then charged in place of the execution
+        window — for cases where the billable quantity is not an execution
+        window at all (an HPC batch job holding QPU licenses for its wall
+        time, say). Default is off, and then `billable` is ignored with a
+        warning.
+
+        Idempotent: a job is billed once. Both a set execution window and a
+        stored `billable` mark it as already billed, so the guard holds for
+        reports that carry no timestamps.
+      security: []
+      parameters:
+        - name: jobid
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JobReport' }
+      responses:
+        '200':
+          description: Job updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/tags:
+    get:
+      tags: [Tags]
+      summary: The tag vocabulary
+      description: |
+        Readable by any authenticated user — a project admin needs the list to
+        pick from. Writable by platform admins only, which is what makes it a
+        controlled vocabulary rather than free text.
+      responses:
+        '200':
+          description: Tags
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Tag' }
+    post:
+      tags: [Tags]
+      summary: Define a tag
+      description: Platform admins only. The name is trimmed and must be unique.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 64 }
+      responses:
+        '200': { description: Created }
+        '409': { description: A tag with that name already exists }
+
+  /api/tags/{id}:
+    get:
+      tags: [Tags]
+      summary: One tag
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Tag }
+        '404': { description: Not found }
+    put:
+      tags: [Tags]
+      summary: Rename a tag
+      description: Platform admins only.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 64 }
+      responses:
+        '200': { description: Updated }
+        '409': { description: A tag with that name already exists }
+    delete:
+      tags: [Tags]
+      summary: Remove a tag from the vocabulary
+      description: |
+        Platform admins only. Refused while any project still carries the tag —
+        cascading would silently strip a label off projects, which an admin
+        cannot undo or even notice. Unassign it first.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200': { description: Deleted }
+        '409': { description: Still assigned to one or more projects }
+
+  /api/projects/{id}/tags:
+    get:
+      tags: [Tags]
+      summary: Tags carried by a project
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        '200':
+          description: Tags on the project
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Tag' }
+    put:
+      tags: [Tags]
+      summary: Set the tags a project carries
+      description: |
+        Platform admins, organization managers, and the project admins of this
+        project. Deliberately a sub-resource rather than a field on
+        `PUT /api/projects/{id}`, which is admin and organization-manager only:
+        widening that so a PI could set tags would also let them change budgets
+        and dates.
+
+        Replaces the whole set, so an empty array clears it. Takes **ids**, not
+        names — accepting names would invite creating a tag by typo, which is
+        what the controlled vocabulary exists to prevent. An id outside the
+        vocabulary is a 400.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tag_ids]
+              properties:
+                tag_ids:
+                  type: array
+                  items: { type: integer }
+      responses:
+        '200':
+          description: The project's tags after the change
+        '400': { description: One or more ids are not in the vocabulary }
+        '403': { description: Not an admin of this project }
+
+  /metrics/jobs:
+    get:
+      tags: [Metrics]
+      summary: Prometheus-style job counters
+      description: |
+        Prometheus text exposition format, untyped and without `# HELP` /
+        `# TYPE` lines. Unauthenticated, like the other machine endpoints.
+
+        Series:
+          * `jobs_total` — every job on record.
+          * `jobs_<status>` — one per status *currently present* in the table,
+            so the set follows the data rather than a fixed list; a job with no
+            status counts as `jobs_unknown`. These are gauges, not counters:
+            a job moving on decrements the status it left.
+          * `jobs_by_organization{organization_id,organization}` and
+            `reservations_by_organization{...}` — one series per organization,
+            including organizations with none (reported as `0`).
+          * `jobs_by_project{project_id,project,organization_id,organization}`
+            — the same count a level lower, including projects with none. The
+            organization is carried as a label so a query can group by it
+            without joining.
+          * `qpu_seconds_by_organization{...}` and `qpu_seconds_by_project{...}`
+            — executed QPU time in seconds, summed over
+            `execution_end - execution_start`.
+          * `users_total` — every user on record.
+          * `users_by_email_domain{domain}` — users grouped by the domain of
+            their address, so a question about one institution is a selector
+            (`users_by_email_domain{domain="studenti.polito.it"}`) rather than
+            a site's naming compiled into the API. An address with no `@`
+            counts in `users_total` and in no domain.
+          * `projects_by_tag{tag_id,tag}` — projects carrying each tag,
+            including tags nobody uses. A project may carry several tags, so
+            unlike the others these series overlap and do not sum to the number
+            of projects.
+
+        The per-organization counts attribute through the **project**
+        (job -> project -> organization), the same rule the billing reports
+        use, rather than through the `jobs.organization_id` snapshot. They are
+        **strict**: a parent does not absorb the counts of the organizations
+        that reference it, so the series sum to the true total.
+
+        QPU seconds are **not** the billing reports' usage figure. A report
+        excludes jobs that ran inside a reservation, because that time is
+        already billed as reserved hours and counting both would bill it twice;
+        these series include them, because they measure machine time consumed.
+        A job that never ran, or one whose window ends before it starts,
+        contributes no seconds while still being counted as a job.
+      security: []
+      responses:
+        '200':
+          description: Job, user, project and tag counts, and executed QPU time
+          content:
+            text/plain:
+              schema: { type: string }
+              example: |
+                jobs_total 4
+                jobs_ready 1
+                jobs_completed 3
+                jobs_by_organization{organization_id="1",organization="LINKS Foundation"} 2
+                reservations_by_organization{organization_id="1",organization="LINKS Foundation"} 1
+                qpu_seconds_by_organization{organization_id="1",organization="LINKS Foundation"} 1830
+                jobs_by_project{project_id="7",project="Rydberg",organization_id="1",organization="LINKS Foundation"} 2
+                qpu_seconds_by_project{project_id="7",project="Rydberg",organization_id="1",organization="LINKS Foundation"} 1830
+                users_total 42
+                users_by_email_domain{domain="studenti.polito.it"} 18
+                projects_by_tag{tag_id="3",tag="teaching"} 5
+
+  /userRoles/{username}:
+    get:
+      tags: [Gateway]
+      summary: Platform roles of a user identity
+      description: |
+        Machine endpoint for the QC Gateway, used on authentication paths whose
+        credential carries no identity-provider roles. Resolves the roles from
+        the stored user record. Internal network only — see the note on the
+        `Gateway` tag.
+      security: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          description: The user identity (`users.email`).
+          schema: { type: string }
+      responses:
+        '200':
+          description: Roles of the identity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  username: { type: string }
+                  roles:
+                    type: array
+                    items: { type: string }
+                    description: >-
+                      `cortex_user` for any known user, plus `pulla_user` when
+                      the user's Pulse-access flag is set.
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /config:
+    get:
+      tags: [Auth]
+      summary: Client-safe deployment flags
+      description: |
+        Public, unauthenticated. Exposes the subset of deployment policy flags
+        the web client needs in order to adapt its UI, so that one dashboard
+        build is valid for every deployment. Booleans only — never secrets or
+        internal configuration.
+      security: []
+      responses:
+        '200':
+          description: Deployment flags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slotConstrainedReservations:
+                    type: boolean
+                    description: >-
+                      Whether reservations must be placed inside a
+                      pre-allocated slot (`SLOT_CONSTRAINED_RESERVATIONS`).
+
+  /api/users:
+    get:
+      tags: [Users]
+      summary: List users
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Users
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/User' } }
+    post:
+      tags: [Users]
+      summary: Create a user (admin, organization-manager)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/User' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/users/{id}:
+    get:
+      tags: [Users]
+      summary: Get a user (admin, organization-manager, project-admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: User
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Users]
+      summary: Update a user (admin, organization-manager)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/User' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /api/users/{id}/projects:
+    get:
+      tags: [Users]
+      summary: Projects the user belongs to
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Projects
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Project' } }
+
+  /api/users/{id}/jobs:
+    get:
+      tags: [Users]
+      summary: Jobs submitted by the user
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+      responses:
+        '200':
+          description: Jobs
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Job' } }
+
+  /api/own/projects:
+    get:
+      tags: [Own]
+      summary: Projects of the authenticated user
+      responses:
+        '200':
+          description: Projects
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Project' } }
+
+  /api/own/default_project:
+    get:
+      tags: [Own]
+      summary: Default project of the authenticated user
+      responses:
+        '200':
+          description: Default project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+    put:
+      tags: [Own]
+      summary: Set the default project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [default_project_id]
+              properties:
+                default_project_id: { type: integer }
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+
+  /api/organizations:
+    get:
+      tags: [Organizations]
+      summary: List organizations
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Organizations
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Organization' } }
+    post:
+      tags: [Organizations]
+      summary: Create an organization (admin) — also creates its vault project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrganizationCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/organizations/{id}:
+    get:
+      tags: [Organizations]
+      summary: Get an organization
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Organization
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+    put:
+      tags: [Organizations]
+      summary: Update an organization (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrganizationCreate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+
+  /api/organizations/{id}/budgetTransfer:
+    post:
+      tags: [Organizations]
+      summary: Transfer budget between two projects of the organization
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceProjectId, destinationProjectId, amount]
+              properties:
+                sourceProjectId: { type: integer }
+                destinationProjectId: { type: integer }
+                amount: { type: number, description: QPU milliseconds (positive) }
+      responses:
+        '201': { description: Transferred }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/organizations/{id}/jobs:
+    get:
+      tags: [Organizations]
+      summary: Jobs of the organization
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+      responses:
+        '200':
+          description: Jobs
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Job' } }
+
+  /api/projects:
+    get:
+      tags: [Projects]
+      summary: List projects
+      description: >-
+        The filter accepts **`q`** — a case-insensitive *substring* match on the
+        project name, the same free-text filter the user list takes. Substring
+        rather than prefix on purpose: project names follow conventions where the
+        distinguishing part is rarely at the front. Also accepts
+        `administrable=true`, which narrows the list to what the caller may
+        administer (everything for an admin, their organization for a manager,
+        their own projects for a PI).
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Projects
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Project' } }
+    post:
+      tags: [Projects]
+      summary: Create a project (admin, organization-manager) — funded from the org vault
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/projects/{id}:
+    get:
+      tags: [Projects]
+      summary: Get a project
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Project
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+    put:
+      tags: [Projects]
+      summary: Update a project (admin, organization-manager)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectCreate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+
+  /api/projects/{id}/users:
+    get:
+      tags: [Projects]
+      summary: Members of the project
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Members
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/User' } }
+    post:
+      tags: [Projects]
+      summary: Add a member by email (admin, organization-manager, project-admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                admin:
+                  type: boolean
+                  description: Grant project-admin on this project
+      responses:
+        '201': { description: Added }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/projects/{id}/transactions:
+    get:
+      tags: [Projects]
+      summary: Budget-event ledger of the project
+      description: >-
+        Each row carries `user_id` and, on this endpoint only, an embedded
+        `user` — the submitter of the job that was charged, or the user who made
+        or cancelled the reservation. Embedded rather than left as a reference
+        because the ledger is one line per transaction and would otherwise cost
+        a user lookup per distinct id.
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+      responses:
+        '200':
+          description: Budget events
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/BudgetEvent' } }
+
+  /api/projects/{id}/jobs:
+    get:
+      tags: [Projects]
+      summary: Jobs of the project
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+      responses:
+        '200':
+          description: Jobs
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Job' } }
+
+  /api/projects_users/{id}:
+    put:
+      tags: [Projects]
+      summary: Update a membership (toggle project-admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                admin: { type: boolean }
+      responses:
+        '200': { description: Updated }
+    delete:
+      tags: [Projects]
+      summary: Remove a membership
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Removed }
+
+  /api/slots:
+    get:
+      tags: [Slots]
+      summary: List slots
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Slots
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Slot' } }
+    post:
+      tags: [Slots]
+      summary: Create a slot (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Slot' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Slot' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/slots/series:
+    post:
+      tags: [Slots]
+      summary: Create a recurring series of slots (admin)
+      description: >
+        Expands the recurrence and checks every occurrence against the rules a
+        single slot must meet. With `dry_run` nothing is written. Otherwise all
+        occurrences are created in one transaction under a shared `series_id`,
+        or — if any conflict and `skip_conflicts` is not set — none are.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [organization_id, recurrence]
+              properties:
+                organization_id: { type: integer }
+                recurrence: { $ref: '#/components/schemas/Recurrence' }
+                dry_run: { type: boolean, default: false }
+                skip_conflicts: { type: boolean, default: false }
+      responses:
+        '200': { description: Preview, content: { application/json: { schema: { $ref: '#/components/schemas/SeriesResult' } } } }
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/SeriesResult' } } } }
+        '409': { description: Refused; nothing written, content: { application/json: { schema: { $ref: '#/components/schemas/SeriesResult' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/slots/series/{seriesId}:
+    delete:
+      tags: [Slots]
+      summary: Delete every future slot of a series (admin)
+      description: >
+        Past slots are kept. Refused, deleting nothing, if any of the future
+        slots holds a reservation — the rule single deletes apply.
+      parameters:
+        - { name: seriesId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  series_id: { type: string, format: uuid }
+                  deleted: { type: integer }
+                  kept_past: { type: integer }
+        '400': { description: A future slot of the series holds reservations }
+        '404': { description: No future slots in this series }
+
+  /api/slots/{id}:
+    get:
+      tags: [Slots]
+      summary: Get a slot
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Slot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Slot' }
+    put:
+      tags: [Slots]
+      summary: Update a slot (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Slot' }
+      responses:
+        '200': { description: Updated }
+    delete:
+      tags: [Slots]
+      summary: Delete a slot (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Deleted }
+
+  /api/reservations:
+    get:
+      tags: [Reservations]
+      summary: List reservations
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Reservations
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Reservation' } }
+    post:
+      tags: [Reservations]
+      summary: Create a reservation (project admins; debits the project budget up-front)
+      description: |
+        The requested window is debited from the project budget immediately.
+        With `SLOT_CONSTRAINED_RESERVATIONS=true` (default) the reservation
+        must fall inside a slot belonging to the project's organization (or
+        its reference organization) and `slot_id` is required; with the flag
+        off, `slot_id` may be omitted and the window is only checked for
+        overlaps, project validity and budget.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/reservations/series:
+    post:
+      tags: [Reservations]
+      summary: Create a recurring series of reservations
+      description: >
+        Each occurrence is placed in the slot of the project's organization (or
+        its reference organization) that covers it — resolved here, not chosen
+        by the caller — and checked against every rule a single reservation
+        must meet. The creatable occurrences' total cost must fit the project's
+        budget; it is debited once and recorded as one budget event per
+        reservation. `dry_run` and `skip_conflicts` as for slot series.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project_id, recurrence]
+              properties:
+                project_id: { type: integer }
+                description: { type: string }
+                recurrence: { $ref: '#/components/schemas/Recurrence' }
+                dry_run: { type: boolean, default: false }
+                skip_conflicts: { type: boolean, default: false }
+      responses:
+        '200': { description: Preview, content: { application/json: { schema: { $ref: '#/components/schemas/SeriesResult' } } } }
+        '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/SeriesResult' } } } }
+        '409': { description: Refused; nothing written, content: { application/json: { schema: { $ref: '#/components/schemas/SeriesResult' } } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/reservations/series/{seriesId}:
+    delete:
+      tags: [Reservations]
+      summary: Delete every future reservation of a series
+      description: >
+        Past reservations are kept. Each deleted one is refunded by the rule
+        single deletes use — in full more than 24 hours ahead, a quarter closer
+        than that — with one budget event each, in one transaction.
+      parameters:
+        - { name: seriesId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  series_id: { type: string, format: uuid }
+                  deleted: { type: integer }
+                  refunded_ms: { type: integer }
+                  kept_past: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: No future reservations in this series }
+
+  /api/reservations/{id}:
+    get:
+      tags: [Reservations]
+      summary: Get a reservation
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Reservation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+    put:
+      tags: [Reservations]
+      summary: Not supported — delete and recreate
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '405': { description: Method not allowed }
+    delete:
+      tags: [Reservations]
+      summary: Delete a future reservation (refunds 100% if >24h ahead, else 25%)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Deleted (budget refunded) }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/jobs:
+    get:
+      tags: [Jobs]
+      summary: List own jobs (scoped to the authenticated user)
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Jobs
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Job' } }
+
+  /api/jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get an own job
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/budgetEvents:
+    get:
+      tags: [Budget events]
+      summary: List budget events (admin)
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Budget events
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/BudgetEvent' } }
+
+  /api/budgetEvents/{id}:
+    get:
+      tags: [Budget events]
+      summary: Get a budget event (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Budget event
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BudgetEvent' }
+
+  /api/reports/reservations:
+    get:
+      tags: [Reports]
+      summary: Reserved time in a period, by project or organization
+      description: >-
+        Reservation blocks lying entirely within the period. Attribution runs
+        through the project, because a reservation carries no organization of
+        its own. Open to platform admins and to organization managers and
+        auditors, who see only their own organization.
+      parameters:
+        - { $ref: '#/components/parameters/reportFrom' }
+        - { $ref: '#/components/parameters/reportTo' }
+        - { $ref: '#/components/parameters/reportGroupBy' }
+      responses:
+        '200':
+          description: Reservation report
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+
+  /api/reports/jobs:
+    get:
+      tags: [Reports]
+      summary: Queue job execution in a period, by project or organization
+      description: >-
+        Jobs whose execution lies entirely within the period. Jobs that ran
+        inside a reservation are excluded — that time is billed as reserved
+        hours, and counting both would bill it twice.
+      parameters:
+        - { $ref: '#/components/parameters/reportFrom' }
+        - { $ref: '#/components/parameters/reportTo' }
+        - { $ref: '#/components/parameters/reportGroupBy' }
+      responses:
+        '200':
+          description: Job report
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+
+  /api/reports/slots:
+    get:
+      tags: [Reports]
+      summary: Allocated slot time in a period, by organization
+      description: >-
+        Slots belong to an organization directly, so this report has no project
+        dimension and ignores `group_by`.
+      parameters:
+        - { $ref: '#/components/parameters/reportFrom' }
+        - { $ref: '#/components/parameters/reportTo' }
+      responses:
+        '200':
+          description: Slot report
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+
+  /api/reports/utilization:
+    get:
+      tags: [Reports]
+      summary: How much of the reserved time was used
+      description: >-
+        The jobs that ran inside a reservation, matched to their block by
+        project and containment, against the hours that block reserved.
+        `count` and `total_seconds`/`total_hours` describe those jobs, so they
+        mean the same as in the other reports.
+      parameters:
+        - { $ref: '#/components/parameters/reportFrom' }
+        - { $ref: '#/components/parameters/reportTo' }
+        - { $ref: '#/components/parameters/reportGroupBy' }
+      responses:
+        '200':
+          description: Utilization report
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/UtilizationReportRow' } }
+
+  /api/reports/summary:
+    get:
+      tags: [Reports]
+      summary: Every report for one period
+      description: >-
+        One round trip instead of four, so the sections of a report cannot
+        drift onto different periods.
+      parameters:
+        - { $ref: '#/components/parameters/reportFrom' }
+        - { $ref: '#/components/parameters/reportTo' }
+      responses:
+        '200':
+          description: All reports for the period
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReportSummary' }
+
+  /api/announcements:
+    get:
+      tags: [Announcements]
+      summary: List announcements
+      responses:
+        '200':
+          description: Announcements
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Announcement' } }
+    post:
+      tags: [Announcements]
+      summary: Create an announcement (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Announcement' }
+      responses:
+        '201': { description: Created }
+
+  /api/announcements/{id}:
+    get:
+      tags: [Announcements]
+      summary: Get an announcement
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Announcement
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Announcement' }
+    put:
+      tags: [Announcements]
+      summary: Update an announcement (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Announcement' }
+      responses:
+        '200': { description: Updated }
+    delete:
+      tags: [Announcements]
+      summary: Delete an announcement (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Deleted }
+
+  /api/activeAnnouncements:
+    get:
+      tags: [Announcements]
+      summary: Announcements currently in their display window
+      responses:
+        '200':
+          description: Active announcements
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Announcement' } }
+
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: List own notifications
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+      responses:
+        '200':
+          description: Notifications
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Notification' } }
+
+  /api/notifications/{id}/read:
+    patch:
+      tags: [Notifications]
+      summary: Mark a notification as read
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200': { description: Marked as read }
+
+  /api/logs:
+    get:
+      tags: [Logs]
+      summary: List audit logs (admin)
+      parameters:
+        - { $ref: '#/components/parameters/range' }
+        - { $ref: '#/components/parameters/sort' }
+        - { $ref: '#/components/parameters/filter' }
+      responses:
+        '200':
+          description: Logs
+          headers:
+            Content-Range: { $ref: '#/components/headers/Content-Range' }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/ActionLog' } }
+
+  /api/logs/{id}:
+    get:
+      tags: [Logs]
+      summary: Get an audit log entry (admin)
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      responses:
+        '200':
+          description: Log entry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionLog' }

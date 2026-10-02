@@ -1,0 +1,19 @@
+{
+  "extends": "@tsconfig/node-lts/tsconfig.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "isolatedModules": true,
+    "outDir": "./dist",
+    "baseUrl": "./src",
+    "paths": {
+      "*": ["*", "*.ts"]
+    },
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": false,
+    "strict": true
+  },
+  "include": ["src"]
+}
