@@ -1,0 +1,165 @@
+services:
+  quantum-api:
+    image: api
+    build: .
+    container_name: quantum-api
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: quantum
+      POSTGRES_USER: quantumapi
+    depends_on:
+      quantum-api-db:
+        condition: service_healthy
+    ports:
+      - 8500:8500
+    restart: always
+    labels:
+      - "loki.job=quantum-api"
+
+  quantum-api-migrate:
+    image: api
+    build: .
+    container_name: quantum-api-migrate
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: quantum
+      POSTGRES_USER: quantumapi
+    command: npm run migrate
+    depends_on:
+      quantum-api-db:
+        condition: service_healthy
+
+  quantum-api-db:
+    image: postgres:18
+    container_name: quantum-api-db
+    # Without a restart policy, the database stayed down after the host came
+    # back from a power-off while quantum-api (restart: always) came up, failed
+    # to connect and restarted forever: an empty dashboard until someone ran
+    # `docker compose up`. depends_on does not help there — it applies to
+    # `compose up`, not to the Docker daemon starting containers at boot.
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quantumapi -d quantum"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: quantum
+      POSTGRES_USER: quantumapi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+
+  quantum-api-db-test:
+    image: postgres:18
+    container_name: api_postgres_test
+    volumes:
+      - postgres_data_test:/var/lib/postgresql
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: quantumtest
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    profiles:
+      - test
+    ports:
+      - "5433:5432"
+
+  # Optional DB admin UI — OFF by default (it requires credentials and should
+  # not be exposed in production). Start it explicitly when needed:
+  #   docker compose --profile pgadmin up -d
+  pgadmin:
+    container_name: pgadmin
+    image: dpage/pgadmin4:latest
+    restart: always
+    profiles:
+      - pgadmin
+    env_file:
+      - .env
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+    ports:
+      - '9500:80'
+
+  # Logical backup of the portal database. On by default, unlike the off-site
+  # copy below: a dump costs a postgres container and some disk, needs nothing
+  # configured, and is the difference between a bad afternoon and a lost
+  # database — including on a development stack, where the thing most likely
+  # to destroy the volume is the person working on it.
+  #
+  # pg_dump snapshots inside a single transaction, so the dump is consistent
+  # with the server still running: no container is stopped and nothing needs
+  # the Docker socket. Uses the postgres image already in this stack rather
+  # than a backup image, because pg_dump must be at least the server version —
+  # the two tags move together.
+  quantum-api-db-dump:
+    image: postgres:18
+    container_name: quantum-api-db-dump
+    restart: always
+    env_file:
+      - .env
+    environment:
+      PGHOST: quantum-api-db
+      PGUSER: quantumapi
+      PGDATABASE: quantum
+      # Ahead of the off-site copy at 03:00, so each night ships that night's dump.
+      DUMP_AT: "01:30"
+      KEEP_DAYS: "7"
+    entrypoint: ["/backup/pg-dump-loop.sh"]
+    volumes:
+      - ./backup:/backup:ro
+      - db_dumps:/dumps
+    healthcheck:
+      test: ["CMD", "/backup/healthcheck.sh"]
+      interval: 1h
+      timeout: 10s
+      retries: 2
+      start_period: 2m
+    depends_on:
+      quantum-api-db:
+        condition: service_healthy
+
+  # Off-site copy of the dumps — OFF by default, because it is the half that
+  # needs somewhere to put them: a development instance has no S3 endpoint and
+  # nothing worth shipping to one. The dump above runs either way, so leaving
+  # this off means backups on disk, not no backups. Enable it on a real
+  # deployment with either
+  #   COMPOSE_PROFILES=backup        (in .env — compose reads it from there)
+  # or
+  #   docker compose --profile backup up -d
+  # and set AWS_ENDPOINT (S3 host:port) plus AWS_ACCESS_KEY_ID /
+  # AWS_SECRET_ACCESS_KEY in .env, which this service loads wholesale.
+  volumes-backup:
+    image: offen/docker-volume-backup:v2.43.3
+    restart: always
+    profiles:
+      - backup
+    env_file:
+      - .env
+    environment:
+      - BACKUP_CRON_EXPRESSION=0 3 * * *
+      - BACKUP_FILENAME=spark_api_db-%Y-%m-%dT%H-%M-%S.{{ .Extension }}
+      - AWS_S3_BUCKET_NAME=spark-quantum-db
+      - AWS_ENDPOINT_PROTO=https
+      - AWS_ENDPOINT_INSECURE=true
+      - BACKUP_RETENTION_DAYS=30
+    volumes:
+      # The dumps, not the live data directory. A file-level copy of a running
+      # server's PGDATA is crash-consistent at best and cannot be relied on to
+      # restore; offen can stop the container around the copy, but only by way
+      # of the Docker socket, which is a worse trade than dumping.
+      - db_dumps:/backup/quantum-dump:ro
+
+
+volumes:
+  postgres_data:
+  postgres_data_test:
+  db_dumps:
