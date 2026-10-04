@@ -2,8 +2,11 @@
   "name": "quantum-api",
   "version": "2026.10.0",
   "description": "",
-  "license": "ISC",
-  "author": "",
+  "license": "EUPL-1.2",
+  "author": "Fabrizio Bertone",
+  "contributors": [
+    "Paolo Viviani"
+  ],
   "type": "module",
   "main": "index.js",
   "scripts": {

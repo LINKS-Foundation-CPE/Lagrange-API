@@ -206,6 +206,14 @@ migrations/              # sequelize-cli database migrations
 - **portable-deployment** — one-command deployment of the whole stack for
   development and integration experiments.
 
+## Authors
+
+Lagrange-API was written mostly by **Fabrizio Bertone**
+([@fblinks](https://github.com/fblinks)), with **Paolo Viviani**
+([@paoloviviani](https://github.com/paoloviviani)), at LINKS Foundation.
+Development before the first public release happened in a private repository,
+so the public history starts there.
+
 ## Citation
 
 If you use Lagrange in your research, please cite:
