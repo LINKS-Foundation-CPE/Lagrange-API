@@ -142,9 +142,22 @@ export const create = async (data: CreateUserDto, user: AuthUser) => {
     });
   }
 
-  return transactionManager.withTransaction(async (tx) => {
-    // TODO: check if default_project is of the same organization (?)
+  // Creating a user also makes them a member of their default project, so the
+  // choice of project is a grant of access, and billing, on that project.
+  // Outside the platform admins, it is limited to the caller's own
+  // organization: an organization manager could otherwise put users into
+  // another organization's project.
+  if (default_project_id && !user.roles.includes("admin")) {
+    const project = await projectRepo.getOne(default_project_id);
+    if (project && project.organization_id !== user.organization?.id) {
+      throw new CustomError({
+        statusCode: 403,
+        message: "Cannot add user to a project of another organization",
+      });
+    }
+  }
 
+  return transactionManager.withTransaction(async (tx) => {
     try {
       const user = await repo.create(data, { transaction: tx });
 
@@ -272,7 +285,7 @@ export const pulseAccessOidcRole = (): string =>
  *
  * Used once, when a Keycloak login registers a user row that did not exist
  * yet: the realm role seeds `users.pulla_user` so that HPC principals — whose
- * SPANK tokens carry no roles, and for whom the gateway's /userRoles lookup is
+ * per-job SLURM tokens carry no roles, and for whom the gateway's /userRoles lookup is
  * the only source — start with the access the realm already gives them.
  *
  * It is a default, not a mirror. Once the row exists the platform is

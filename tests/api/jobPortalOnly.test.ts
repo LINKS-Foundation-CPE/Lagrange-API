@@ -145,4 +145,86 @@ describe("JOB_PORTAL_ONLY", () => {
     expect(updated!.execution_start).not.toBeNull();
     expect(updated!.execution_end).not.toBeNull();
   });
+
+  describe("reported project", () => {
+    // The reporter is the authority on the project here — for an HPC site it
+    // is the SLURM --account — and there is no endpoint left to pre-create it
+    // with, so an unknown name has to be accepted rather than rejected.
+    const reportFor = (project_name: string, username: string, jobid: string) =>
+      request(global.__APP__).post("/jobReport").send({
+        project_name,
+        username,
+        jobid,
+        submitted_datetime: new Date(),
+      });
+
+    it("creates a project it has never seen, in the user's organization", async () => {
+      const org = await initializer.initOrganization(
+        `org-reported-${Math.floor(Math.random() * 1_000_000)}`,
+      );
+      const user = await initializer.initUser({
+        email: `hpcuser-${Math.floor(Math.random() * 1_000_000)}@example.com`,
+        sub: `hpc-sub-${Math.floor(Math.random() * 1_000_000)}`,
+        organization_id: org.id,
+      });
+      const name = `slurm-account-${Math.floor(Math.random() * 1_000_000)}`;
+      expect(await projectRepo.getByName(name)).toBeNull();
+
+      process.env[FLAG] = "true";
+      try {
+        await reportFor(name, user.email, `hpc-${name}`).expect(200);
+      } finally {
+        delete process.env[FLAG];
+      }
+
+      const created = await projectRepo.getByName(name);
+      expect(created).not.toBeNull();
+      expect(created!.organization_id).toEqual(org.id);
+      // Nothing is billed in this mode, so the row is bookkeeping, not budget.
+      expect(created!.free_queue).toBe(true);
+      expect(Number(created!.remaining_budget)).toEqual(0);
+
+      const job = await repo.getByJobid(`hpc-${name}`);
+      expect(job!.project_id).toEqual(created!.id);
+    });
+
+    it("reuses the project on the next job rather than failing on the unique name", async () => {
+      const org = await initializer.initOrganization(
+        `org-reused-${Math.floor(Math.random() * 1_000_000)}`,
+      );
+      const user = await initializer.initUser({
+        email: `hpcuser2-${Math.floor(Math.random() * 1_000_000)}@example.com`,
+        sub: `hpc-sub2-${Math.floor(Math.random() * 1_000_000)}`,
+        organization_id: org.id,
+      });
+      const name = `slurm-account-twice-${Math.floor(Math.random() * 1_000_000)}`;
+
+      process.env[FLAG] = "true";
+      try {
+        await reportFor(name, user.email, `hpc-a-${name}`).expect(200);
+        await reportFor(name, user.email, `hpc-b-${name}`).expect(200);
+      } finally {
+        delete process.env[FLAG];
+      }
+
+      const jobA = await repo.getByJobid(`hpc-a-${name}`);
+      const jobB = await repo.getByJobid(`hpc-b-${name}`);
+      expect(jobB!.project_id).toEqual(jobA!.project_id);
+    });
+
+    it("still rejects an unknown project when the flag is off", async () => {
+      const org = await initializer.initOrganization(
+        `org-strict-${Math.floor(Math.random() * 1_000_000)}`,
+      );
+      const user = await initializer.initUser({
+        email: `hpcuser3-${Math.floor(Math.random() * 1_000_000)}@example.com`,
+        sub: `hpc-sub3-${Math.floor(Math.random() * 1_000_000)}`,
+        organization_id: org.id,
+      });
+      const name = `never-created-${Math.floor(Math.random() * 1_000_000)}`;
+
+      await reportFor(name, user.email, `hpc-off-${name}`).expect(400);
+      expect(await projectRepo.getByName(name)).toBeNull();
+    });
+  });
 });

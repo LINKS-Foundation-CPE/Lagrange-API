@@ -18,6 +18,31 @@ change to `.env`, `docker-compose.yaml`, or a new database migration.
 
 ## [Unreleased]
 
+## [2026.11.0] — 2026-11-10
+
+### Security
+- **Compressed request bodies are refused** (HTTP 415). Body parsing runs before
+  authentication, so decompressing a `Content-Encoding: br` or `gzip` body put
+  attacker-supplied data through `node:zlib`. That is the path CVE-2026-111497,
+  an out-of-bounds write in the Brotli decoder, takes into a Node process. No
+  client sends compressed bodies.
+- **The image is rebuilt on a fresh base.** The deploy now runs
+  `docker compose build --pull`, and the base image is pinned to `node:24`
+  instead of `node:lts`. Before, the host's cached image was reused forever and
+  Node security releases never arrived.
+- **An organization manager can no longer add users to another organization's
+  project.** Creating a user also makes them a member of their default project,
+  and the backend did not check whose project it was (a `TODO` in
+  `user.service.ts`), so an organization manager could put users into, and bill,
+  another organization's project. Outside the platform admins, the default
+  project of a new user must now belong to the caller's organization; otherwise
+  the request gets 403 and nothing is written (quantum-dashboard#31).
+
+### Fixed
+- **Bad requests get 4xx, not 500.** Errors that Express middleware raises for a
+  client mistake (malformed JSON, an oversized or compressed body) are now
+  answered with their own status, e.g. 400 or 415, instead of a generic 500.
+
 ## [2026.10.0] — 2026-10-02
 
 ### Fixed
@@ -275,6 +300,24 @@ change to `.env`, `docker-compose.yaml`, or a new database migration.
   `/auth/token`, `/jobReport`, `/userRoles` and `/metrics` remain. Exposed on
   `/config` so the dashboard can hide the views whose endpoints are gone. For a
   deployment whose authorization and accounting live elsewhere.
+- Under `JOB_PORTAL_ONLY`, a job report naming a project that does not exist
+  **creates it** instead of being rejected. The reporter is the authority on
+  the project in that mode — for an HPC site it is the SLURM `--account` the
+  job was charged to — and the endpoint that would otherwise create projects is
+  not mounted, so an unknown name could never be accepted. The row is
+  bookkeeping, not budget: `free_queue` with a zero balance, in the reporting
+  user's organization (or the only organization there is, for a user
+  provisioned by their first login). Unchanged with the flag off: an unknown
+  project is still a 400.
+- Under `USERNAME_FORMAT=any`, `/auth/token` falls back to the token's
+  `preferred_username` when it carries no `email` claim, and that value becomes
+  the user's identity. With the default `email` nothing changes: a token without
+  an e-mail is still refused. Sites running
+  `USERNAME_FORMAT=any` identify people by something that is not an e-mail —
+  a cluster account name — and Keycloak validates the format of its own e-mail
+  field, so those users have none. The identity has to be the same string the
+  job reporter sends or a user cannot see their own jobs. Tokens carrying an
+  e-mail are unaffected.
 - **Reported billing**, opt-in via `ACCEPT_REPORTED_BILLING` (default `false`).
   The terminal `PUT /jobReport/{jobid}` may carry a `billable` integer, and that
   amount is charged in place of `execution_end - execution_start`. For

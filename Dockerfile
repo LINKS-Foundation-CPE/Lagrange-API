@@ -1,4 +1,7 @@
-FROM node:lts
+# A major line, not `lts`: `lts` moves to a new major on its own schedule, which
+# would change the runtime under a routine rebuild. Patch releases still arrive,
+# because the deploy rebuilds with --pull.
+FROM node:24
 
 WORKDIR /api
 COPY package*.json ./

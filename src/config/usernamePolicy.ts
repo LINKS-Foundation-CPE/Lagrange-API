@@ -7,7 +7,7 @@ import logger from "./logger.ts";
  *
  *   USERNAME_FORMAT=email  — historical Lagrange behaviour (default)
  *   USERNAME_FORMAT=any    — any whitespace-free string (e.g. HPC cluster
- *                            account names in the Sqed/CINECA deployment)
+ *                            account names, when users submit from SLURM jobs)
  *
  * The value is FROZEN at first deployment: `freezeUsernameFormat()` persists
  * it in the `system_configs` table on first boot and refuses to start the

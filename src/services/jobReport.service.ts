@@ -1,6 +1,7 @@
 import CustomError from "config/CustomError.ts";
 import * as repo from "../repositories/job.repository.ts";
 import * as projectRepo from "../repositories/project.repository.ts";
+import * as organizationRepo from "../repositories/organization.repository.ts";
 import * as budgetEventRepo from "../repositories/budgetEvent.repository.ts";
 import * as userRepo from "../repositories/user.repository.ts";
 import * as reservationRepo from "../repositories/reservation.repository.ts";
@@ -13,6 +14,67 @@ import {
   UpdateJobReportDto,
 } from "schemas/jobReport.schema.ts";
 import { DateTime } from "luxon";
+import { User } from "models/index.ts";
+
+/**
+ * Create the project a job report names, for deployments where the reporter is
+ * the authority on it.
+ *
+ * Only reached under `JOB_PORTAL_ONLY`, and only when no project of that name
+ * exists. There, the accounting entity is decided elsewhere — a SLURM
+ * `--account`, say, which the job reporter passes through as `project_name` —
+ * and this API has no endpoint left to create projects with, so a report for
+ * an unknown one would otherwise be rejected forever.
+ *
+ * The row is bookkeeping, not a budget: nothing is billed in this mode, so it
+ * is created `free_queue` with a zero budget. That also keeps jobs working if
+ * the flag is later turned off, instead of failing against an empty budget.
+ *
+ * The organization is the reporting user's. Falling back to the only
+ * organization that exists covers the ordinary single-site deployment, where a
+ * user provisioned by their first login has none yet; anything ambiguous is an
+ * error rather than a guess.
+ */
+async function provisionReportedProject(name: string, user: User) {
+  let organizationId = user.organization_id ?? null;
+
+  if (organizationId === null) {
+    const organizations = await organizationRepo.getList({});
+    if (organizations.count === 1) {
+      organizationId = organizations.rows[0].id;
+    }
+  }
+
+  if (organizationId === null) {
+    throw new CustomError({
+      statusCode: 400,
+      message:
+        `cannot create reported project '${name}': user ${user.email} has no ` +
+        `organization and the deployment does not have exactly one to fall ` +
+        `back to. Assign the user an organization.`,
+    });
+  }
+
+  const project = await projectRepo.create({
+    name,
+    organization_id: organizationId,
+    free_queue: true,
+    remaining_budget: 0,
+  });
+
+  logger.info(
+    `created reported project '${name}' (id ${project.id}) in organization ${organizationId}`,
+  );
+  logToDatabase({
+    userId: user.id,
+    action: "create",
+    resource: "projects",
+    resourceId: project.id,
+    description: `project ${name} created from a job report (JOB_PORTAL_ONLY)`,
+  });
+
+  return project;
+}
 
 export async function create(data: CreateJobReportDto) {
   const {
@@ -97,6 +159,11 @@ export async function create(data: CreateJobReportDto) {
   // if job was authorized, project (if defined) should exist and valid for the user
   if (project_name) {
     project = await projectRepo.getByName(project_name);
+    // In job-portal-only mode the reporter is the authority on the project and
+    // there is no endpoint left to pre-create it with — see above.
+    if (!project && policy.jobPortalOnly) {
+      project = await provisionReportedProject(project_name, user);
+    }
   }
 
   logger.debug(`project_name: ${project_name}`);

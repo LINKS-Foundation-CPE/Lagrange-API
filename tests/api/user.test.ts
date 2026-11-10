@@ -472,6 +472,60 @@ describe("user routes", () => {
     spy.mockRestore();
   });
 
+  it("should return 403 for user creation into another organization's project", async () => {
+    // Issue quantum-dashboard#31: creating a user also makes them a member of
+    // their default project, so an organization manager must not be able to
+    // pick a project of another organization.
+    const links = await initializer.initLinksOrganization();
+    const polito = await initializer.initPolitoOrganization();
+    const linksManagerUser = await initializer.initLinksUser({
+      organization_manager: true,
+    });
+    const politoProject = await initializer.initFreeQueueProject(polito, 0);
+
+    const spy = jest.spyOn(jwt, "decode").mockReturnValue({
+      header: validHeader,
+      payload: { email: linksManagerUser.email, sub: linksManagerUser.sub },
+      signature: randomSignature,
+    });
+
+    const orgManagerToken = generateToken(
+      validHeader,
+      {
+        email: linksManagerUser.email,
+        sub: linksManagerUser.sub,
+        roles: ["organization-manager"],
+        organization: {
+          id: linksManagerUser.organization_id,
+          name: "Links",
+        },
+      },
+      randomSignature,
+    );
+
+    const res = await request(global.__APP__)
+      .post(`/api/users`)
+      .set("Authorization", `Bearer ${orgManagerToken}`)
+      .send({
+        email: "intruder@links.com",
+        organization_id: links.id,
+        default_project_id: politoProject.id,
+      })
+      .expect(403);
+
+    expect(res.body).toHaveProperty(
+      "message",
+      "Cannot add user to a project of another organization",
+    );
+    // Refused before anything is written: no user, no membership.
+    const members = await politoProject.getUsers();
+    expect(members.map((u: { email: string }) => u.email)).not.toContain(
+      "intruder@links.com",
+    );
+
+    spy.mockRestore();
+  });
+
   it("an admin should be able to add users to any organization", async () => {
     const links = await initializer.initLinksOrganization();
     const polito = await initializer.initPolitoOrganization();

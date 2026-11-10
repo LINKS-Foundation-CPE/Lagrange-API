@@ -43,7 +43,12 @@ export const createApp = (sequelize: Sequelize) => {
   initModels(sequelize);
 
   const app = express();
-  app.use(bodyParser.json());
+  // `inflate: false`: compressed request bodies are refused with 415 instead
+  // of being decompressed. No client sends them (the gateway and the dashboard
+  // post plain JSON), and decompressing runs attacker-supplied data through
+  // node:zlib before authentication: that is how CVE-2026-111497 (Brotli
+  // decoder) would have reached this process.
+  app.use(bodyParser.json({ inflate: false }));
 
   // enable CORS if not on localhost
   if (process.env.CORS_ORIGIN) {

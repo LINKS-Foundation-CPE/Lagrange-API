@@ -6,6 +6,7 @@ import https from "https";
 import { User, Organization, Notification, ProjectUser } from "models/index";
 import * as userService from "services/user.service";
 import logger from "config/logger";
+import { usernameFormat } from "config/usernamePolicy";
 import { logToDatabase } from "utils/index";
 
 const tokenRouter = Router();
@@ -13,10 +14,29 @@ const tokenRouter = Router();
 // Shape of the Keycloak-issued token payload consumed here.
 interface KeycloakToken extends jwt.JwtPayload {
   sub: string;
-  email: string;
+  email?: string;
+  preferred_username?: string;
   name?: string;
   realm_access: { roles: string[] };
 }
+
+/**
+ * The identity this deployment knows a user by, stored in `users.email`.
+ *
+ * Normally the e-mail claim. Sites whose identities are not e-mail addresses
+ * run with `USERNAME_FORMAT=any` — an HPC cluster reporting jobs under a local
+ * account name, for instance — and there the Keycloak user has no e-mail to
+ * claim, so the username is the identity. It has to be the *same* string the
+ * job reporter sends, or a user's own jobs are attributed to nobody.
+ *
+ * Only under `USERNAME_FORMAT=any`. With the default `email`, a token without an
+ * e-mail claim still has no identity (a 401), exactly as before: falling back
+ * there would register a non-e-mail user on a deployment that promises e-mail
+ * identities.
+ */
+export const identityOf = (decoded: KeycloakToken): string | undefined =>
+  decoded.email ||
+  (usernameFormat() === "any" ? decoded.preferred_username : undefined);
 
 const httpsAgent = new https.Agent({
   rejectUnauthorized: false, // Accept self-signed cert for test server
@@ -116,7 +136,7 @@ async function getUserOrganization(decoded: KeycloakToken) {
   // first search user by sub (that is not initially set)
   const user = await User.findOne({
     where: {
-      email: decoded.email,
+      email: identityOf(decoded),
     },
     include: [
       {
@@ -136,6 +156,11 @@ async function getUserOrganization(decoded: KeycloakToken) {
  */
 // TODO: refactor to avoid side effects (extract DB updates in dedicated functions)
 async function getUserInformation(decoded: KeycloakToken) {
+  const identity = identityOf(decoded);
+  if (!identity) {
+    // Nothing to key the row on. Caught by the route handler as a 401.
+    throw new Error("token carries neither email nor preferred_username");
+  }
   // first search user by sub (that is not initially set)
   let user = await User.findOne({
     where: {
@@ -176,7 +201,7 @@ async function getUserInformation(decoded: KeycloakToken) {
   if (!user) {
     user = await User.findOne({
       where: {
-        email: decoded.email,
+        email: identity,
       },
       include: [
         {
@@ -221,7 +246,7 @@ async function getUserInformation(decoded: KeycloakToken) {
       //await log.save()
     } else {
       // if user is not found in database, add it
-      logger.info(`Adding new user to database (${decoded.email}))`);
+      logger.info(`Adding new user to database (${identity}))`);
       // The realm role seeds Pulse (sweep) access for a brand-new identity, so
       // the gateway's /userRoles lookup grants HPC principals what the realm
       // already gives them. Only at registration: afterwards the flag is the
@@ -230,7 +255,7 @@ async function getUserInformation(decoded: KeycloakToken) {
         decoded.realm_access?.roles ?? [],
       );
       user = await User.create({
-        email: decoded.email,
+        email: identity,
         sub: decoded.sub,
         pulla_user,
       });
@@ -297,7 +322,9 @@ tokenRouter.post("/", async (req, res) => {
       {
         id: user.id,
         sub: decoded.sub,
-        email: decoded.email,
+        // The resolved identity, not the raw claim: they differ when the
+        // Keycloak user has no e-mail (see identityOf).
+        email: user.email,
         name: decoded.name || null,
         roles: roles,
         organization: user.organization,

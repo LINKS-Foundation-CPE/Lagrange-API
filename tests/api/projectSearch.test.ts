@@ -41,8 +41,8 @@ describe("GET /api/projects — free-text search", () => {
   const seed = async () => {
     const links = await initializer.initLinksOrganization();
     for (const name of [
-      "CINECA-2026-lattice",
-      "CINECA-2026-qaoa",
+      "HPCLAB-2026-lattice",
+      "HPCLAB-2026-qaoa",
       "POLITO-2025-qaoa",
     ]) {
       await projectRepo.create({
@@ -58,7 +58,7 @@ describe("GET /api/projects — free-text search", () => {
     // "qaoa" is in the middle of nothing and at the end of two — a prefix
     // match would return neither.
     expect(await search("qaoa")).toEqual([
-      "CINECA-2026-qaoa",
+      "HPCLAB-2026-qaoa",
       "POLITO-2025-qaoa",
     ]);
   });
@@ -66,16 +66,16 @@ describe("GET /api/projects — free-text search", () => {
   it("is case-insensitive", async () => {
     await seed();
     expect(await search("QAOA")).toEqual([
-      "CINECA-2026-qaoa",
+      "HPCLAB-2026-qaoa",
       "POLITO-2025-qaoa",
     ]);
   });
 
   it("still matches on a prefix", async () => {
     await seed();
-    expect(await search("CINECA")).toEqual([
-      "CINECA-2026-lattice",
-      "CINECA-2026-qaoa",
+    expect(await search("HPCLAB")).toEqual([
+      "HPCLAB-2026-lattice",
+      "HPCLAB-2026-qaoa",
     ]);
   });
 
