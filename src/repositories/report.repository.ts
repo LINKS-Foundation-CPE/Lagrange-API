@@ -25,6 +25,13 @@ export interface ReportRow {
   total_seconds: string | null;
 }
 
+export interface ReservationRow extends ReportRow {
+  past_count: string;
+  past_seconds: string | null;
+  future_count: string;
+  future_seconds: string | null;
+}
+
 export interface UtilizationRow extends ReportRow {
   usage_seconds: string | null;
   reserved_seconds: string | null;
@@ -66,16 +73,27 @@ const orgScope = (organizationId?: number) =>
  *
  * Reservations carry no organization of their own, so attribution runs through
  * the project. A reservation counts only if it lies entirely within the period.
+ *
+ * Each row is also split at `cutoff` by start time: a reservation starting
+ * before it is *past* (already used, or too close to be given back), one
+ * starting at or after it is *future* (booked, not yet used). Past and future
+ * add up to the totals.
  */
 export const reservations = async (
   { from, to, organizationId }: ReportPeriod,
   groupBy: "project" | "organization",
-): Promise<ReportRow[]> => {
+  cutoff: Date,
+): Promise<ReservationRow[]> => {
   const g = grouping(groupBy);
-  return sequelize().query<ReportRow>(
+  const seconds = `EXTRACT(EPOCH FROM (r."end" - r."start"))`;
+  return sequelize().query<ReservationRow>(
     `SELECT ${g.select},
             COUNT(*)::text AS count,
-            SUM(EXTRACT(EPOCH FROM (r."end" - r."start")))::text AS total_seconds
+            SUM(${seconds})::text AS total_seconds,
+            COUNT(*) FILTER (WHERE r."start" < :cutoff)::text AS past_count,
+            SUM(${seconds}) FILTER (WHERE r."start" < :cutoff)::text AS past_seconds,
+            COUNT(*) FILTER (WHERE r."start" >= :cutoff)::text AS future_count,
+            SUM(${seconds}) FILTER (WHERE r."start" >= :cutoff)::text AS future_seconds
        FROM reservations r
        JOIN projects p ON p.id = r.project_id
        LEFT JOIN organizations o ON o.id = p.organization_id
@@ -86,7 +104,7 @@ export const reservations = async (
       GROUP BY ${g.by}
       ORDER BY ${g.by}`,
     {
-      replacements: { from, to, organizationId },
+      replacements: { from, to, organizationId, cutoff },
       type: QueryTypes.SELECT,
     },
   );

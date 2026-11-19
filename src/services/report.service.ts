@@ -34,6 +34,22 @@ export interface ReportRow {
   total_hours: number;
 }
 
+export interface ReservationReportRow extends ReportRow {
+  past_count: number;
+  past_seconds: number;
+  past_hours: number;
+  future_count: number;
+  future_seconds: number;
+  future_hours: number;
+}
+
+/**
+ * Where a reservation stops being "booked" and starts being "past": anything
+ * starting less than 24 hours from now. Within that horizon a block can no
+ * longer realistically be given back, so it counts as consumed.
+ */
+export const PAST_HORIZON_MS = 24 * 3600 * 1000;
+
 export interface UtilizationReportRow extends ReportRow {
   usage_hours: number;
   reserved_hours: number;
@@ -85,8 +101,27 @@ const period = (user: AuthUser, query: ReportQueryDto) => ({
   organizationId: scopeFor(user),
 });
 
-export const reservations = async (user: AuthUser, query: ReportQueryDto) =>
-  (await repo.reservations(period(user, query), query.group_by)).map(shape);
+export const reservations = async (
+  user: AuthUser,
+  query: ReportQueryDto,
+  now: Date = new Date(),
+): Promise<ReservationReportRow[]> =>
+  (
+    await repo.reservations(
+      period(user, query),
+      query.group_by,
+      new Date(now.getTime() + PAST_HORIZON_MS),
+    )
+  ).map((row) => ({
+    ...shape(row),
+    past_count: Number(row.past_count ?? 0),
+    past_seconds: row.past_seconds === null ? 0 : Number(row.past_seconds),
+    past_hours: hours(row.past_seconds),
+    future_count: Number(row.future_count ?? 0),
+    future_seconds:
+      row.future_seconds === null ? 0 : Number(row.future_seconds),
+    future_hours: hours(row.future_seconds),
+  }));
 
 export const jobs = async (user: AuthUser, query: ReportQueryDto) =>
   (await repo.jobs(period(user, query), query.group_by)).map(shape);

@@ -41,6 +41,7 @@ describe("GET /api/reports", () => {
   let projectA: Awaited<ReturnType<typeof initializer.initNoFreeQueueProject>>;
   let projectB: Awaited<ReturnType<typeof initializer.initNoFreeQueueProject>>;
   let adminToken: string;
+  let reporterId: number;
 
   // Per test, not per suite: the shared setup truncates every table before
   // each case, so fixtures built once would be gone by the first assertion.
@@ -55,6 +56,7 @@ describe("GET /api/reports", () => {
       sub: `reporter-sub-${suffix}`,
       organization_id: orgA.id,
     });
+    reporterId = user.id;
     adminToken = tokenFor(["admin"]);
 
     // Queue jobs for project A: 1 h and 30 min, both wholly inside the period.
@@ -172,6 +174,54 @@ describe("GET /api/reports", () => {
         to: TO,
       }).expect(200);
       expect(rowFor(res.body, projectA.id)).toBeUndefined();
+    });
+  });
+
+  describe("reservations: past and future", () => {
+    // Relative to now: the split is "starts less than 24 hours from now".
+    const H = 3600 * 1000;
+    const block = async (startOffsetH: number, lengthH: number) => {
+      const start = new Date(Date.now() + startOffsetH * H);
+      await reservationRepo.create({
+        project_id: projectA.id,
+        slot_id: null,
+        day: new Date(start.toISOString().slice(0, 10)),
+        start,
+        end: new Date(start.getTime() + lengthH * H),
+        made_by: reporterId,
+        description: null,
+      });
+    };
+
+    it("splits at 24 hours from now, by start, and adds up to the totals", async () => {
+      await block(-48, 2); // used two days ago
+      await block(12, 1); // starts in 12 h: inside the horizon, so past
+      await block(72, 3); // starts in 3 days: booked, not yet used
+      const res = await get("/api/reports/reservations", adminToken, {
+        from: new Date(Date.now() - 30 * 24 * H).toISOString(),
+        to: new Date(Date.now() + 30 * 24 * H).toISOString(),
+      }).expect(200);
+      const row = rowFor(res.body, projectA.id)!;
+      expect(row.count).toBe(3);
+      expect(row.past_count).toBe(2);
+      expect(row.future_count).toBe(1);
+      expect(row.past_hours).toBeCloseTo(3);
+      expect(row.future_hours).toBeCloseTo(3);
+      expect(row.past_hours + row.future_hours).toBeCloseTo(row.total_hours);
+      expect(row.past_seconds + row.future_seconds).toBeCloseTo(
+        row.total_seconds,
+      );
+    });
+
+    it("reports zero, not null, when one side is empty", async () => {
+      const res = await get("/api/reports/reservations", adminToken, {
+        from: FROM,
+        to: TO,
+      }).expect(200);
+      const row = rowFor(res.body, projectA.id)!;
+      expect(row.future_count).toBe(0);
+      expect(row.future_hours).toBe(0);
+      expect(row.past_count).toBe(row.count);
     });
   });
 

@@ -173,6 +173,22 @@ components:
         count: { type: integer, description: Rows counted (jobs, reservations or slots) }
         total_seconds: { type: number }
         total_hours: { type: number }
+    ReservationReportRow:
+      allOf:
+        - $ref: '#/components/schemas/ReportRow'
+        - type: object
+          description: >-
+            The row split at 24 hours from now, by start time. A reservation
+            starting before then is past (used, or too close to give back);
+            one starting later is future (booked, not yet used). Past and
+            future add up to count and total.
+          properties:
+            past_count: { type: integer }
+            past_seconds: { type: number }
+            past_hours: { type: number }
+            future_count: { type: integer }
+            future_seconds: { type: number }
+            future_hours: { type: number }
     UtilizationReportRow:
       allOf:
         - $ref: '#/components/schemas/ReportRow'
@@ -195,8 +211,8 @@ components:
         reservations:
           type: object
           properties:
-            by_project: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
-            by_organization: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+            by_project: { type: array, items: { $ref: '#/components/schemas/ReservationReportRow' } }
+            by_organization: { type: array, items: { $ref: '#/components/schemas/ReservationReportRow' } }
         jobs:
           type: object
           properties:
@@ -1573,7 +1589,7 @@ paths:
             Content-Range: { $ref: '#/components/headers/Content-Range' }
           content:
             application/json:
-              schema: { type: array, items: { $ref: '#/components/schemas/ReportRow' } }
+              schema: { type: array, items: { $ref: '#/components/schemas/ReservationReportRow' } }
 
   /api/reports/jobs:
     get:

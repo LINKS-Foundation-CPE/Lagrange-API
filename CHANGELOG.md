@@ -18,6 +18,14 @@ change to `.env`, `docker-compose.yaml`, or a new database migration.
 
 ## [Unreleased]
 
+### Added
+- **Reservation reports split past and future.** Each reservations row (by
+  project and by organization, in `/api/reports/reservations` and the summary)
+  also carries `past_count`/`past_seconds`/`past_hours` and the `future_`
+  equivalents, split at 24 hours from now by start time: a block starting
+  before then is past (used, or too close to give back), a later one is booked
+  but not yet used. They add up to the existing totals, which are unchanged.
+
 ## [2026.11.0] — 2026-11-10
 
 ### Security
