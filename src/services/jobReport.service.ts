@@ -5,6 +5,8 @@ import * as organizationRepo from "../repositories/organization.repository.ts";
 import * as budgetEventRepo from "../repositories/budgetEvent.repository.ts";
 import * as userRepo from "../repositories/user.repository.ts";
 import * as reservationRepo from "../repositories/reservation.repository.ts";
+import { Coverage, coverageFor } from "./reservationCoverage.ts";
+import { ledgerDescription, ledgerWindow } from "../utils/ledgerTime.ts";
 import { logToDatabase } from "utils/index.ts";
 import { transactionManager } from "models/index.ts";
 import logger from "config/logger.ts";
@@ -15,6 +17,7 @@ import {
 } from "schemas/jobReport.schema.ts";
 import { DateTime } from "luxon";
 import { User } from "models/index.ts";
+import { updateSession } from "./session.service.ts";
 
 /**
  * Create the project a job report names, for deployments where the reporter is
@@ -88,6 +91,8 @@ export async function create(data: CreateJobReportDto) {
     results = null,
     submitted_circuit = null,
     job_type,
+    session_id = null,
+    session_kind = null,
   } = data;
 
   let start = null;
@@ -179,6 +184,14 @@ export async function create(data: CreateJobReportDto) {
     throw new CustomError({ statusCode: 400, message: `project not found` });
   }
 
+  // Provisional. Whether a job ran inside its project's reservation is decided
+  // when it is billed, from its execution window (see update). Until then this
+  // only says the job was submitted during one, and only one of its own
+  // project's: a reservation of another project covers nothing of this job.
+  if (reservation && reservation.project_id !== project.id) {
+    usedReservation = false;
+  }
+
   const job = await repo.create({
     project_id: project.id,
     organization_id: project.organization_id,
@@ -192,6 +205,8 @@ export async function create(data: CreateJobReportDto) {
     submitted_circuit,
     usedReservation,
     job_type: job_type,
+    session_id,
+    session_kind,
     // The creating report never bills, so there is nothing charged to record.
     billable: null,
   });
@@ -217,6 +232,13 @@ export const update = async (jobid: string, data: UpdateJobReportDto) => {
           statusCode: 404,
           message: `jobid ${jobid} not found`,
         });
+      }
+
+      // A session row was charged when it opened (see session.service): its
+      // reports only record progress, and refund a session that never started.
+      if (job.is_session) {
+        await updateSession(job, data);
+        return;
       }
 
       // A job is billed exactly once. The execution window being set has
@@ -289,6 +311,28 @@ export const update = async (jobid: string, data: UpdateJobReportDto) => {
         job.billable = reported;
       }
 
+      // Reservation coverage, from when the job EXECUTED. The flag set at
+      // submission only says it was submitted during a reservation: a job
+      // queued just before one runs inside it, and was billed for time the
+      // reservation had already paid. With an execution window, the window
+      // decides, against this job's own project's reservations only.
+      let coverage: Coverage | null = null;
+      if (job.execution_start && job.execution_end) {
+        coverage = await coverageFor(
+          job.project_id,
+          { start: job.execution_start, end: job.execution_end },
+          tx,
+        );
+        job.usedReservation = coverage.insideMs > 0;
+        // Which reservations, and how much: what the job list shows as
+        // "billed as part of reservation N". Recomputed on every terminal
+        // report, like the flag.
+        job.reservation_ids =
+          coverage.insideMs > 0 ? coverage.reservationIds : null;
+        job.reservation_covered_ms =
+          coverage.insideMs > 0 ? coverage.insideMs : null;
+      }
+
       await job.save({ transaction: tx });
 
       const project = await projectRepo.getOne(job.project_id);
@@ -319,17 +363,50 @@ export const update = async (jobid: string, data: UpdateJobReportDto) => {
       // What to charge: the reported amount when the deployment supplies one,
       // otherwise the execution window in milliseconds as always. Computed
       // before the free-queue/reservation check so both paths share it.
+      //
+      // Only the part of the execution outside the project's reservations is
+      // billed: a job wholly inside one costs nothing more, a job straddling
+      // either edge of one is charged for the part outside it. A reported
+      // amount is scaled by the same fraction. Without an execution window
+      // there is nothing to measure, and the submission-time flag decides, as
+      // it always has.
       let bill: number | null = null;
       let billDescription = "";
+      const window =
+        job.execution_start && job.execution_end
+          ? ledgerWindow(job.execution_start, job.execution_end)
+          : "";
+      const split = (c: Coverage) =>
+        c.insideMs > 0
+          ? `; ${c.insideMs} ms inside reservation ${c.reservationIds.join(", ")} not billed, ${c.outsideMs} ms billed`
+          : "";
       if (reported !== null) {
-        bill = reported;
-        billDescription = `Job ${job.jobid} (${job.id}) reported billable ${reported}`;
-      } else if (execution_start && execution_end) {
-        const start = DateTime.fromISO(execution_start);
-        const end = DateTime.fromISO(execution_end);
-        const duration = end.diff(start);
-        bill = duration.as("milliseconds");
-        billDescription = `Job ${job.jobid} (${job.id}) ${job.execution_start} - ${job.execution_end})`;
+        if (coverage && coverage.durationMs > 0) {
+          bill = Math.round(
+            (reported * coverage.outsideMs) / coverage.durationMs,
+          );
+          billDescription = `Job ${job.jobid} (${job.id}) reported billable ${reported}, ${window}${split(coverage)}${coverage.insideMs > 0 ? ` (charged ${bill})` : ""}`;
+        } else {
+          bill = job.usedReservation ? 0 : reported;
+          billDescription = `Job ${job.jobid} (${job.id}) reported billable ${reported}`;
+        }
+      } else if (execution_start && execution_end && coverage) {
+        if (coverage.durationMs === 0) {
+          logger.warn(
+            `job ${jobid}: execution window is empty or ends before it starts (${execution_start} - ${execution_end}); nothing billed`,
+          );
+        }
+        bill = coverage.outsideMs;
+        billDescription = `Job ${job.jobid} (${job.id}) ${window}${split(coverage)}`;
+      }
+
+      // A job run inside a QPU session is not charged: the session was charged
+      // up front for the whole time it holds the machine.
+      if (job.session_id && bill !== null) {
+        logger.debug(
+          `job ${jobid} ran in session ${job.session_id}: not billed`,
+        );
+        bill = null;
       }
 
       // A job-viewer deployment charges nothing: accounting lives elsewhere, so
@@ -341,15 +418,16 @@ export const update = async (jobid: string, data: UpdateJobReportDto) => {
         bill = null;
       }
 
-      // if project is not free queue AND is not inside a reservation, bill it
-      if (!project.free_queue && bill !== null && !job.usedReservation) {
+      // Free-queue projects are never billed; nothing is charged for time a
+      // reservation already paid (bill is then 0, and no ledger row is written).
+      if (!project.free_queue && bill !== null && bill > 0) {
         project.remaining_budget = Number(project.remaining_budget) - bill;
         await project.save({ transaction: tx });
         await budgetEventRepo.create(
           {
             project_id: project.id,
             value: -bill,
-            description: billDescription,
+            description: ledgerDescription(billDescription),
             billing: true,
             // Who ran it. The description already names the job; without this
             // the person behind the charge is a second lookup away.

@@ -23,6 +23,10 @@ export const createJobReportSchema = z.object({
   results: z.url().nullish(),
   submitted_circuit: z.url().nullish(),
   job_type: z.string().nullish(),
+  // Set when the job runs inside a QPU session (see /sessionReport): it is then
+  // not charged, the session having been charged up front.
+  session_id: z.string().nullish(),
+  session_kind: z.string().nullish(),
 });
 
 export const updateJobReportSchema = createJobReportSchema.partial().extend({

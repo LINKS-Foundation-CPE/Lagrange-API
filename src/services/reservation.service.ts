@@ -1,4 +1,5 @@
 import CustomError from "config/CustomError.ts";
+import { ledgerDescription, ledgerWindow } from "../utils/ledgerTime.ts";
 import * as repo from "../repositories/reservation.repository.ts";
 import * as slotRepo from "../repositories/slot.repository.ts";
 import * as projectRepo from "../repositories/project.repository.ts";
@@ -142,7 +143,9 @@ export async function create(data: CreateReservationDto, user: AuthUser) {
       {
         project_id: project.id,
         value: -milliSeconds,
-        description: `reservation ${reservation.id} (${reservation.day} ${reservation.start} - ${reservation.end})`,
+        description: ledgerDescription(
+          `reservation ${reservation.id} (${ledgerWindow(reservation.start, reservation.end)})`,
+        ),
         billing: true,
         user_id: user.id,
       },
@@ -153,7 +156,7 @@ export async function create(data: CreateReservationDto, user: AuthUser) {
       userId: user.id,
       action: "create",
       resource: "reservations",
-      description: `Reservation ${reservation.id} (${reservation.day}: ${reservation.start} - ${reservation.end}) created by user ${user.email} (${user.sub})`,
+      description: `Reservation ${reservation.id} (${ledgerWindow(reservation.start, reservation.end)}) created by user ${user.email} (${user.sub})`,
     });
 
     return reservation;
@@ -236,7 +239,7 @@ export const destroy = async (id: number, user: AuthUser) => {
     action: "delete",
     resource: "reservations",
     resourceId: record.id,
-    description: `User ${user.email} deleted reservation on ${record.day} (${record.start} - ${record.end}) for project ${project?.name} (${project?.id}) - refunded ${refund}`,
+    description: `User ${user.email} deleted reservation ${record.id} (${ledgerWindow(record.start, record.end)}) for project ${project?.name} (${project?.id}) - refunded ${refund}`,
   });
 
   return transactionManager.withTransaction(async (tx) => {
@@ -247,7 +250,9 @@ export const destroy = async (id: number, user: AuthUser) => {
         {
           project_id: project.id,
           value: refund,
-          description: `reservation deleted ${record.id} (${record.day} ${record.start} - ${record.end})`,
+          description: ledgerDescription(
+            `reservation deleted ${record.id} (${ledgerWindow(record.start, record.end)})`,
+          ),
           billing: true,
           user_id: user.id,
         },

@@ -27,6 +27,8 @@ export const create = (
     | "organization_manager"
     | "organization_auditor"
     | "pulla_user"
+    | "session_access"
+    | "session_max_seconds"
   >,
   options?: { transaction?: Transaction },
 ) => User.create(data, options);

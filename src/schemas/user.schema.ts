@@ -9,6 +9,8 @@ export const createUserSchema = z.object({
   organization_manager: z.boolean().nullish(),
   organization_auditor: z.boolean().nullish(),
   pulla_user: z.boolean().nullish(),
+  session_access: z.boolean().nullish(),
+  session_max_seconds: z.number().int().positive().nullish(),
 });
 
 export const updateUserSchema = createUserSchema.partial();

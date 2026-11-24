@@ -54,8 +54,9 @@ for style.
    its behaviour (schema migrations aside). Current flags:
    `SLOT_CONSTRAINED_RESERVATIONS` (default true), `ALLOW_FOREIGN_ORG_QUEUE_IN_SLOTS`
    (default true), `USERNAME_FORMAT` (default `email`, frozen at first
-   deployment in `system_configs`), and `PULSE_ACCESS_OIDC_ROLE` (default
-   `pulla_user` — the realm role that seeds `users.pulla_user` at first registration).
+   deployment in `system_configs`), `PULSE_ACCESS_OIDC_ROLE` (default
+   `pulla_user` — the realm role that seeds `users.pulla_user` at first registration),
+   and `LEDGER_TIME_ZONE` (display only; default unset, UTC).
 
 ## Where things live
 

@@ -18,6 +18,80 @@ change to `.env`, `docker-compose.yaml`, or a new database migration.
 
 ## [Unreleased]
 
+## [2026.11.1] — 2026-11-24
+
+### Changed
+- **Backup schedule on a configurable clock.** The nightly dump and the
+  off-site copy ran on UTC with no way to say otherwise, while a host's other
+  backups typically run on local time. `BACKUP_TZ`, `DUMP_AT` and
+  `BACKUP_CRON` set the clock and both times; defaults (UTC, 01:30, 03:00)
+  are unchanged. The off-site copy can notify failures to
+  `BACKUP_NOTIFICATION_URLS`. Both services now receive only the variables
+  they use instead of the whole `.env`.
+
+### Fixed
+- **Reserved time was billed twice for jobs queued just before a
+  reservation.** Whether a job ran inside its project's reservation was
+  decided when it was submitted, so a job submitted shortly before a
+  reservation, queued, and executed inside it was billed in full on top of the
+  reservation. Coverage is now decided at billing time from the **execution
+  window** `[execution_start, execution_end)`, in UTC, against the job's
+  **own project's** reservations, and only the execution **outside** them is
+  billed:
+  - wholly inside: nothing billed, `usedReservation=true`;
+  - straddling a reservation's start or end: only the outside part billed, and
+    the ledger entry says how much was inside and not billed;
+  - wholly outside, or during another project's reservation: billed as before.
+
+  A reported `billable` amount (`ACCEPT_REPORTED_BILLING`) is scaled by the
+  same outside fraction. Without an execution window, the submission-time flag
+  still decides, as before. The submission-time flag no longer names another
+  project's reservation: a job reported for project A during project B's
+  reservation was flagged and never billed.
+- **Reports follow the same rule.** `/api/reports/jobs` counts each job's
+  execution outside its project's reservations (no longer the
+  `usedReservation` flag), and `/api/reports/utilization` counts the
+  execution inside each block, clipped to it, so a job straddling a block's
+  edge now contributes its inside part instead of nothing.
+
+### Added
+- **QPU sessions** (an exclusive hold on the machine for a bounded time — IQM
+  calls them iterations). Vendor-neutral; the gateway maps the vendor's API.
+  - Per-user grant: `users.session_access` (default off) and
+    `users.session_max_seconds`, which replaces the deployment default
+    (gateway `SESSION_MAX_SECONDS`) up or down. Administrators only.
+  - `POST /sessionAuthorizer` (gateway): grant, project, budget, and refusal
+    when the session could overlap another project's reservation.
+  - `POST /sessionReport` (gateway): records the session as a row
+    (`is_session`) and charges the granted time up front, less any part inside
+    the project's own reservations. The terminal `PUT /jobReport/{id}` settles
+    it: the active time, idle included, stays charged, the rest is refunded; a
+    session that never started is refunded in full.
+  - Jobs run inside a session carry `session_id` / `session_kind` and are not
+    charged.
+  - Migration `20261124120000-qpu-sessions`: new columns only, defaults keep
+    existing behaviour.
+- **Which reservation covered a job.** Jobs carry `reservation_ids` and
+  `reservation_covered_ms`: the reservations of their own project the
+  execution overlapped, and how many ms of it they covered (not charged). Set
+  at billing alongside `usedReservation`, and by the overlap refund. The
+  migration backfills them for flagged jobs with an execution window; jobs
+  charged in full under the earlier rule stay null. This is what lets the job
+  list say "billed as part of reservation N".
+- **Vault refill**: `POST /api/organizations/:id/vault/refill` (platform
+  admins) adds QPU time to an organization's vault and writes the matching
+  ledger entry in one transaction, attributed to the admin, with an optional
+  note. Until now a vault could only be funded at creation; topping it up
+  meant editing the database, with no ledger trace.
+- `scripts/refund-reservation-overlap.ts <reservation id> [--apply]`: refunds,
+  for one reservation, the time jobs were billed although the current rule
+  would not charge it, as a ledger credit naming the billing transactions and
+  the reservation. Dry run by default; idempotent (transactions an earlier
+  refund covered are skipped).
+- `LEDGER_TIME_ZONE`: ledger descriptions show times as ISO 8601 UTC instead
+  of JavaScript's "GMT+0000 (Coordinated Universal Time)" string, plus local
+  time in that zone when it is set (e.g. `Europe/Rome`).
+
 ### Added
 - **Reservation reports split past and future.** Each reservations row (by
   project and by organization, in `/api/reports/reservations` and the summary)
@@ -448,6 +522,8 @@ individual changes.
   responses.
 - Docker Compose deployment with an optional self-signed TLS overlay.
 
-[Unreleased]: https://github.com/LINKS-Foundation-CPE/Lagrange-API/compare/2026.10.0...HEAD
+[Unreleased]: https://github.com/LINKS-Foundation-CPE/Lagrange-API/compare/2026.11.1...HEAD
+[2026.11.1]: https://github.com/LINKS-Foundation-CPE/Lagrange-API/compare/2026.11.0...2026.11.1
+[2026.11.0]: https://github.com/LINKS-Foundation-CPE/Lagrange-API/releases/tag/2026.11.0
 [2026.10.0]: https://github.com/LINKS-Foundation-CPE/Lagrange-API/releases/tag/2026.10.0
 [2026.07.0]: https://github.com/LINKS-Foundation-CPE/Lagrange-API/releases/tag/2026.07.0

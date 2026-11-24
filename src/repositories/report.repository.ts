@@ -111,11 +111,31 @@ export const reservations = async (
 };
 
 /**
- * Queue jobs executed in the period, by project or organization.
+ * Seconds of a job's execution inside its own project's reservations.
  *
- * Jobs that ran inside a reservation are **excluded**: that time is already
- * billed as reserved hours, and counting both would bill it twice. The count is
- * a count of jobs — there is no shots column to weight it by.
+ * Reservations cannot overlap each other, so summing the overlaps is exact.
+ * Intervals are half-open: a job ending as a reservation starts overlaps it by
+ * zero. This is the same rule billing applies (services/reservationCoverage).
+ */
+const INSIDE_SECONDS = `COALESCE((
+    SELECT SUM(EXTRACT(EPOCH FROM (
+             LEAST(j.execution_end, r."end") - GREATEST(j.execution_start, r."start"))))
+      FROM reservations r
+     WHERE r.project_id = j.project_id
+       AND r."start" < j.execution_end
+       AND r."end"   > j.execution_start
+  ), 0)`;
+
+/**
+ * Queue time executed in the period, by project or organization.
+ *
+ * Only the part of each job's execution **outside** its project's
+ * reservations: the part inside was paid with the reservation, and counting
+ * it again would bill it twice. A job wholly inside a reservation contributes
+ * nothing and is not counted; a job straddling a reservation edge contributes
+ * its outside part. Decided by when the job executed, not by the
+ * submission-time `usedReservation` flag, which is what billing does too.
+ * `count` is the number of jobs with any queue time.
  */
 export const jobs = async (
   { from, to, organizationId }: ReportPeriod,
@@ -123,16 +143,22 @@ export const jobs = async (
 ): Promise<ReportRow[]> => {
   const g = grouping(groupBy);
   return sequelize().query<ReportRow>(
-    `SELECT ${g.select},
+    `WITH queue AS (
+       SELECT j.project_id,
+              EXTRACT(EPOCH FROM (j.execution_end - j.execution_start))
+                - ${INSIDE_SECONDS} AS outside_seconds
+         FROM jobs j
+        WHERE j.execution_start >= :from
+          AND j.execution_end   <= :to
+          AND j.execution_end   >= j.execution_start
+     )
+     SELECT ${g.select},
             COUNT(*)::text AS count,
-            SUM(EXTRACT(EPOCH FROM (j.execution_end - j.execution_start)))::text AS total_seconds
-       FROM jobs j
-       JOIN projects p ON p.id = j.project_id
+            SUM(q.outside_seconds)::text AS total_seconds
+       FROM queue q
+       JOIN projects p ON p.id = q.project_id
        LEFT JOIN organizations o ON o.id = p.organization_id
-      WHERE j.execution_start >= :from
-        AND j.execution_end   <= :to
-        AND j.execution_end   >= j.execution_start
-        AND COALESCE(j."usedReservation", false) = false
+      WHERE q.outside_seconds > 0
         ${orgScope(organizationId)}
       GROUP BY ${g.by}
       ORDER BY ${g.by}`,
@@ -177,15 +203,17 @@ export const slots = async ({
 /**
  * How much of the reserved time was actually used.
  *
- * The counterpart to `jobs`: the jobs that ran *inside* a reservation, matched
- * to their block by project and containment, against the hours that block
- * reserved. `count` is those jobs; `total_seconds` is their execution time, so
- * the column means the same thing as in the other reports.
+ * The counterpart to `jobs`: for each reservation block in the period, the
+ * execution of its project's jobs that falls inside the block, clipped to it,
+ * against the hours the block reserved. A job straddling a block edge
+ * contributes the part inside it, exactly as billing leaves that part
+ * uncharged. `count` is the jobs that ran at least partly inside;
+ * `total_seconds` is that inside time, so the column means the same thing as
+ * in the other reports. Decided by when jobs executed, not by the
+ * submission-time `usedReservation` flag.
  *
  * The join is per block, so a project's blocks are summed rather than matched
- * as one lump — two reservations on the same day are two denominators. A job
- * that straddles a block boundary belongs to neither, exactly as a job
- * straddling the period boundary belongs to no period.
+ * as one lump: two reservations on the same day are two denominators.
  */
 export const utilization = async (
   { from, to, organizationId }: ReportPeriod,
@@ -206,15 +234,15 @@ export const utilization = async (
        SELECT b.id, b.project_id, b.reserved_seconds,
               COUNT(j.id) AS job_count,
               COALESCE(
-                SUM(EXTRACT(EPOCH FROM (j.execution_end - j.execution_start))), 0
+                SUM(EXTRACT(EPOCH FROM (
+                  LEAST(j.execution_end, b."end") - GREATEST(j.execution_start, b."start")))), 0
               ) AS usage_seconds
          FROM blocks b
          LEFT JOIN jobs j
                 ON j.project_id       = b.project_id
-               AND COALESCE(j."usedReservation", false) = true
-               AND j.execution_start >= b."start"
-               AND j.execution_end   <= b."end"
-               AND j.execution_end   >= j.execution_start
+               AND j.execution_start < b."end"
+               AND j.execution_end   > b."start"
+               AND j.execution_end   > j.execution_start
         GROUP BY b.id, b.project_id, b.reserved_seconds
      )
      SELECT ${g.select},

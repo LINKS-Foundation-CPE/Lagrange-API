@@ -122,9 +122,9 @@ backups.
 | | |
 |---|---|
 | What | `pg_dump --format=custom` of the whole `quantum` database |
-| When | 01:30 local, plus once on every container start |
+| When | `DUMP_AT` (default 01:30) on the `BACKUP_TZ` clock (default UTC), plus once on every container start |
 | Where | the `db_dumps` volume, kept 7 days |
-| Off-site | `volumes-backup` archives that volume to S3 at 03:00, kept 30 days |
+| Off-site | `volumes-backup` archives that volume to S3 on `BACKUP_CRON` (default 03:00, same clock), kept 30 days; failures notify `BACKUP_NOTIFICATION_URLS` if set |
 
 `pg_dump` snapshots inside a single transaction, so the dump is consistent with
 the API still serving. Nothing is stopped and nothing is given the Docker

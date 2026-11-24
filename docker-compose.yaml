@@ -104,14 +104,19 @@ services:
     image: postgres:18
     container_name: quantum-api-db-dump
     restart: always
-    env_file:
-      - .env
+    # Only the password it needs, not the whole .env.
     environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       PGHOST: quantum-api-db
       PGUSER: quantumapi
       PGDATABASE: quantum
-      # Ahead of the off-site copy at 03:00, so each night ships that night's dump.
-      DUMP_AT: "01:30"
+      # The clock DUMP_AT is read on. Unset is UTC, as it always was; a host
+      # whose other jobs run on local time sets BACKUP_TZ (e.g. Europe/Rome) so
+      # the night's schedule is on one clock.
+      TZ: ${BACKUP_TZ:-}
+      # Ahead of the off-site copy (BACKUP_CRON below), so each night ships that
+      # night's dump. Keep it out of 02:00-03:00 on a DST zone.
+      DUMP_AT: ${DUMP_AT:-01:30}
       KEEP_DAYS: "7"
     entrypoint: ["/backup/pg-dump-loop.sh"]
     volumes:
@@ -136,16 +141,22 @@ services:
   # or
   #   docker compose --profile backup up -d
   # and set AWS_ENDPOINT (S3 host:port) plus AWS_ACCESS_KEY_ID /
-  # AWS_SECRET_ACCESS_KEY in .env, which this service loads wholesale.
+  # AWS_SECRET_ACCESS_KEY in .env; the service receives only those.
   volumes-backup:
     image: offen/docker-volume-backup:v2.43.3
     restart: always
     profiles:
       - backup
-    env_file:
-      - .env
     environment:
-      - BACKUP_CRON_EXPRESSION=0 3 * * *
+      - AWS_ENDPOINT=${AWS_ENDPOINT:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - TZ=${BACKUP_TZ:-}
+      - BACKUP_CRON_EXPRESSION=${BACKUP_CRON:-0 3 * * *}
+      # Failures are otherwise silent. A shoutrrr URL (smtp://, teams://, ...);
+      # unset, no notification is sent.
+      - NOTIFICATION_URLS=${BACKUP_NOTIFICATION_URLS:-}
+      - NOTIFICATION_LEVEL=error
       - BACKUP_FILENAME=spark_api_db-%Y-%m-%dT%H-%M-%S.{{ .Extension }}
       - AWS_S3_BUCKET_NAME=spark-quantum-db
       - AWS_ENDPOINT_PROTO=https

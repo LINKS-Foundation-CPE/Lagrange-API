@@ -11,6 +11,7 @@ import { transactionManager } from "models/index.ts";
 import { logToDatabase } from "utils/index.ts";
 import CustomError from "config/CustomError.ts";
 import { AuthUser } from "../types/auth.ts";
+import { ledgerDescription } from "../utils/ledgerTime.ts";
 
 export const getList = async (
   user: AuthUser,
@@ -95,6 +96,81 @@ export const getOne = async (id: number) => {
     });
 
   return org;
+};
+
+/**
+ * Add budget to an organization's vault: the way new QPU time enters an
+ * organization after its creation.
+ *
+ * The vault's balance and its ledger move together, in one transaction, with
+ * the vault row locked so concurrent refills or transfers cannot lose an
+ * update. The ledger entry is attributed to the admin who made it and is not a
+ * charge (`billing: false`), like the vault's initial funding.
+ */
+export const refillVault = async (
+  user: AuthUser,
+  orgId: number,
+  amount: number,
+  note?: string,
+) => {
+  return transactionManager.withTransaction(async (tx) => {
+    const organization = await organizationRepo.getOne(orgId);
+    if (!organization) {
+      throw new CustomError({
+        statusCode: 404,
+        message: `Organization ${orgId} not found`,
+      });
+    }
+    if (!organization.vault_project_id) {
+      throw new CustomError({
+        statusCode: 409,
+        message: `Organization ${organization.name} has no vault`,
+      });
+    }
+    const vault = await projectRepo.getOneForUpdate(
+      organization.vault_project_id,
+      tx,
+    );
+    if (!vault) {
+      throw new CustomError({
+        statusCode: 409,
+        message: `Vault project ${organization.vault_project_id} of ${organization.name} not found`,
+      });
+    }
+
+    vault.remaining_budget = Number(vault.remaining_budget) + amount;
+    await vault.save({ transaction: tx });
+
+    const hours = Math.round((amount / 3_600_000) * 1000) / 1000;
+    const event = await budgetEventRepo.create(
+      {
+        project_id: vault.id,
+        value: amount,
+        billing: false,
+        user_id: user.id,
+        description: ledgerDescription(
+          `vault refill (${organization.name}): +${amount} ms (${hours} h) by ${user.email}${note ? `: ${note}` : ""}`,
+        ),
+      },
+      { transaction: tx },
+    );
+
+    logToDatabase({
+      userId: user.id,
+      action: "transaction",
+      resource: "budgetEvents",
+      resourceId: event.id,
+      description: `Vault ${vault.name} (${vault.id}) of organization ${organization.name} (${organization.id}) refilled with ${amount} ms by ${user.email} (${user.sub})`,
+    });
+
+    return {
+      organization_id: organization.id,
+      vault_project_id: vault.id,
+      amount,
+      remaining_budget: Number(vault.remaining_budget),
+      budget_event_id: event.id,
+    };
+  });
 };
 
 export const transferBudget = async (

@@ -6,6 +6,7 @@ import { restrictOrganization } from "../middleware/restrictOrganization.ts";
 import {
   createOrganizationSchema,
   updateOrganizationSchema,
+  vaultRefillSchema,
 } from "../schemas/organization.schema.ts";
 
 const router = Router();
@@ -43,6 +44,15 @@ router.post(
   requireRoles("admin", "organization-manager"),
   // TODO: validate
   controller.budgetTransfer,
+);
+
+// Adds budget to the organization's vault, with a ledger entry. Platform admins
+// only: this is money entering the platform, not moving inside an organization.
+router.post(
+  "/:id/vault/refill",
+  requireRoles("admin"),
+  validate(vaultRefillSchema),
+  controller.refillVault,
 );
 
 router.get(

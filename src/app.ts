@@ -36,6 +36,10 @@ import errorHandler from "./middleware/errorHandler.ts";
 import jobAuthorizerRouter from "./routes/jobAuthorizer.routes.ts";
 import jobReportRouter from "./routes/jobReport.routes.ts";
 import userRolesRouter from "./routes/userRoles.routes.ts";
+import {
+  sessionAuthorizerRouter,
+  sessionReportRouter,
+} from "./routes/session.routes.ts";
 import { initModels } from "./models/index.ts";
 import { parseQueryIntoFilters } from "middleware/parseQuery.ts";
 
@@ -135,6 +139,10 @@ export const createApp = (sequelize: Sequelize) => {
   // Machine endpoints: these POPULATE the job list, so they stay in both modes.
   app.use("/jobReport", jobReportRouter);
   app.use("/userRoles", userRolesRouter);
+  // QPU sessions (e.g. IQM iterations). Mounted in both modes: the per-user
+  // grant is checked either way; under JOB_PORTAL_ONLY nothing is charged.
+  app.use("/sessionAuthorizer", sessionAuthorizerRouter);
+  app.use("/sessionReport", sessionReportRouter);
   app.use("/metrics", metricsRoutes);
 
   // generic error handler middleware

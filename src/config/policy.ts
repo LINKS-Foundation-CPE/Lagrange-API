@@ -1,3 +1,4 @@
+import { IANAZone } from "luxon";
 import logger from "./logger.ts";
 
 /**
@@ -86,6 +87,21 @@ export const policy = {
    *
    * Default false: existing deployments are full portals and change nothing.
    */
+  /**
+   * IANA time zone (e.g. `Europe/Rome`) to show next to the UTC times in
+   * ledger descriptions. Unset, they show UTC only, as ISO 8601. Users read
+   * a bare "GMT+0000" time as local time and report charges as wrong.
+   */
+  get ledgerTimeZone(): string | null {
+    const raw = (process.env.LEDGER_TIME_ZONE ?? "").trim();
+    if (raw === "") return null;
+    if (!IANAZone.isValidZone(raw)) {
+      logger.warn(`Invalid LEDGER_TIME_ZONE '${raw}': showing UTC only`);
+      return null;
+    }
+    return raw;
+  },
+
   get jobPortalOnly(): boolean {
     return parseBool("JOB_PORTAL_ONLY", false);
   },

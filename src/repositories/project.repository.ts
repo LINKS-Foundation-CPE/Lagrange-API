@@ -69,6 +69,13 @@ export const getList = (
 // both a start and end time. COALESCE handles the case where no jobs match (SUM returns NULL).
 // For non-free_queue projects the field is always 0.
 // ::bigint casts the result to an integer instead of decimal
+/**
+ * A project's row, locked for the rest of the transaction: for read-modify-
+ * write of `remaining_budget`, so concurrent updates cannot lose one another.
+ */
+export const getOneForUpdate = (id: number, transaction: Transaction) =>
+  Project.findByPk(id, { transaction, lock: transaction.LOCK.UPDATE });
+
 export const getOne = (id: number) =>
   Project.findOne({
     where: { id },

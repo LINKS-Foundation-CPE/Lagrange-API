@@ -54,10 +54,19 @@ export const getList = async (
  * from this flag, so whoever can set it can grant machine capability.
  */
 const dropPulseAccessUnlessAdmin = (
-  data: { pulla_user?: boolean | null },
+  data: {
+    pulla_user?: boolean | null;
+    session_access?: boolean | null;
+    session_max_seconds?: number | null;
+  },
   user: AuthUser,
 ) => {
-  if (!user.roles.includes("admin")) delete data.pulla_user;
+  if (!user.roles.includes("admin")) {
+    delete data.pulla_user;
+    // Session access holds the whole machine: the same rule as pulse access.
+    delete data.session_access;
+    delete data.session_max_seconds;
+  }
 };
 
 export const update = async (

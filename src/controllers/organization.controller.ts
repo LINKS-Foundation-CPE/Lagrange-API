@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { VaultRefillDto } from "../schemas/organization.schema.ts";
 import * as service from "../services/organization.service.ts";
 import { parseQuery } from "utils/query.ts";
 import { setGetListHeaders } from "utils/headers.ts";
@@ -49,6 +50,17 @@ export const budgetTransfer = async (req: Request, res: Response) => {
   );
 
   res.status(201).json({ message: "ok" });
+};
+
+export const refillVault = async (req: Request, res: Response) => {
+  const { amount, note } = req.body as VaultRefillDto;
+  const result = await service.refillVault(
+    req.user,
+    Number(req.params.id),
+    amount,
+    note,
+  );
+  res.status(201).json(result);
 };
 
 export const getJobList = async (req: Request, res: Response) => {

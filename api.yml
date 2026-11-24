@@ -255,6 +255,17 @@ components:
             Pulse access — sweep submission. Settable by administrators and
             mirrored from the identity provider at login; reported by
             `GET /userRoles/{username}`.
+        session_access:
+          type: boolean
+          description: >-
+            May open QPU sessions (exclusive holds on the machine, e.g. IQM
+            iterations). Administrators only; default off.
+        session_max_seconds:
+          type: [integer, 'null']
+          description: >-
+            This user's longest session in seconds. Replaces the deployment
+            default (gateway `SESSION_MAX_SECONDS`) when set, above or below
+            it. Administrators only.
 
     Organization:
       type: object
@@ -421,7 +432,37 @@ components:
         submitted_datetime: { type: string, format: date-time }
         submitted_circuit: { type: [string, 'null'], format: uri }
         results: { type: [string, 'null'], format: uri }
-        usedReservation: { type: boolean }
+        usedReservation:
+          type: boolean
+          description: >-
+            Whether the job executed, at least in part, inside a reservation of
+            its own project. Set when the job is billed, from its execution
+            window; before that it only says the job was submitted during one.
+        reservation_ids:
+          type: [array, 'null']
+          items: { type: integer }
+          description: >-
+            The reservations of the job's own project that its execution
+            overlapped. Set with `usedReservation` when the job is billed; null
+            when no reservation covered it.
+        is_session:
+          type: boolean
+          description: >-
+            The row is a QPU session (`jobid` = vendor session id, `job_type` =
+            vendor term, e.g. `iteration`), charged up front and settled when
+            it ends; `billable` is what it was charged.
+        session_id:
+          type: [string, 'null']
+          description: For a job run inside a session, the session's id; such a job is not charged.
+        session_kind:
+          type: [string, 'null']
+          description: The session's vendor term, e.g. `iteration`.
+        reservation_covered_ms:
+          type: [integer, 'null']
+          description: >-
+            How much of the execution those reservations covered, in ms. That
+            part is not charged: equal to the execution time, the job was billed
+            entirely as part of the reservation; less, only the rest was charged.
 
     JobReport:
       type: object
@@ -437,6 +478,10 @@ components:
         project_name: { type: [string, 'null'] }
         status: { type: [string, 'null'] }
         job_type: { type: [string, 'null'] }
+        session_id:
+          type: [string, 'null']
+          description: The QPU session the job runs in, if any (see /sessionReport). Such a job is not charged.
+        session_kind: { type: [string, 'null'] }
         execution_start: { type: [string, 'null'], format: date-time }
         execution_end: { type: [string, 'null'], format: date-time }
         submitted_datetime: { type: string, format: date-time }
@@ -612,9 +657,14 @@ paths:
       tags: [Gateway]
       summary: Update a job to a terminal state (bills the job)
       description: |
-        On completion with both execution timestamps, projects that are not
-        `free_queue` and jobs that did not run inside a reservation are billed
-        `execution_end - execution_start` milliseconds.
+        On completion with both execution timestamps, a project that is not
+        `free_queue` is billed the milliseconds of `[execution_start,
+        execution_end)` that lie **outside** its own reservations: reserved time
+        is paid when the reservation is made. A job wholly inside one is billed
+        nothing; one straddling a reservation's start or end is billed the
+        part outside it, and the ledger entry records the split. Coverage is
+        decided by when the job executed, not when it was submitted, and only
+        the job's own project's reservations count.
 
         A deployment with `ACCEPT_REPORTED_BILLING=true` may instead send a
         `billable` amount, which is then charged in place of the execution
@@ -810,8 +860,9 @@ paths:
         that reference it, so the series sum to the true total.
 
         QPU seconds are **not** the billing reports' usage figure. A report
-        excludes jobs that ran inside a reservation, because that time is
-        already billed as reserved hours and counting both would bill it twice;
+        excludes the execution that fell inside the job's project's
+        reservations, because that time is already billed as reserved hours and
+        counting both would bill it twice;
         these series include them, because they measure machine time consumed.
         A job that never ran, or one whose window ends before it starts,
         contributes no seconds while still being counted as a job.
@@ -835,6 +886,88 @@ paths:
                 users_by_email_domain{domain="studenti.polito.it"} 18
                 projects_by_tag{tag_id="3",tag="teaching"} 5
 
+  /sessionAuthorizer:
+    post:
+      tags: [Gateway]
+      summary: May this user open a QPU session, and for how long
+      description: |
+        Machine endpoint for the QC Gateway, before it opens a QPU session (an
+        exclusive hold on the machine — IQM calls them iterations). No
+        credential, internal network only, like `/jobReport` — see the note on
+        the `Gateway` tag; the gateway has already authenticated the user.
+
+        Refused (403) when the user has no `session_access`, the project is not
+        theirs or not active, the session could overlap **another** project's
+        reservation, or the project's budget does not cover the granted time
+        (not checked for `free_queue` projects or under `JOB_PORTAL_ONLY`).
+        Granted: the smaller of `requested_seconds` and the user's
+        `session_max_seconds` if set, else `default_max_seconds`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, requested_seconds, default_max_seconds]
+              properties:
+                username: { type: string }
+                project_name: { type: [string, 'null'] }
+                requested_seconds: { type: integer, minimum: 1 }
+                default_max_seconds:
+                  type: integer
+                  minimum: 1
+                  description: The deployment default (gateway `SESSION_MAX_SECONDS`).
+      responses:
+        '200':
+          description: Granted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  granted_seconds: { type: integer }
+                  project_name: { type: string }
+                  charge_ms:
+                    type: integer
+                    description: What opening it will charge (the part outside the project's own reservations).
+        '403':
+          description: Refused, with `message`
+  /sessionReport:
+    post:
+      tags: [Gateway]
+      summary: Record an opened QPU session and charge it
+      description: |
+        Machine endpoint for the QC Gateway, once the machine has accepted the
+        session. Creates the session's row in the job list (`is_session`,
+        `jobid` = the vendor's session id, `job_type` = the vendor's term) and
+        charges the granted time up front, less any part inside the project's
+        own reservations. Idempotent on `session_id`.
+
+        Later reports for the same id go to `PUT /jobReport/{session_id}` with
+        `status`, `execution_start` (when it became active) and `execution_end`
+        (when it ended). The terminal report settles the charge: the active
+        time, idle included, stays charged and the rest is refunded; a session
+        that never became active is refunded in full. Jobs run inside the
+        session are reported with `session_id` and are not charged.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, session_id, session_kind, granted_seconds, opened_at]
+              properties:
+                username: { type: string }
+                project_name: { type: [string, 'null'] }
+                session_id: { type: string }
+                session_kind: { type: string, example: iteration }
+                granted_seconds: { type: integer, minimum: 1 }
+                opened_at: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Recorded (or already recorded)
   /userRoles/{username}:
     get:
       tags: [Gateway]
@@ -1100,6 +1233,45 @@ paths:
         '201': { description: Transferred }
         '400': { $ref: '#/components/responses/ValidationError' }
         '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/organizations/{id}/vault/refill:
+    post:
+      tags: [Organizations]
+      summary: Add budget to the organization's vault (platform admins)
+      description: >-
+        How new QPU time enters an organization after its creation. The vault's
+        balance and a ledger entry (`billing: false`, attributed to the admin)
+        are written together in one transaction, with the vault row locked.
+        The note, if any, is appended to the ledger description (for instance
+        the order or agreement the time comes from).
+      parameters: [{ $ref: '#/components/parameters/id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount: { type: integer, minimum: 1, description: QPU milliseconds to add }
+                note: { type: string, maxLength: 120 }
+      responses:
+        '201':
+          description: Refilled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organization_id: { type: integer }
+                  vault_project_id: { type: integer }
+                  amount: { type: integer }
+                  remaining_budget: { type: number, description: The vault's balance after the refill }
+                  budget_event_id: { type: integer }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: The organization has no vault }
 
   /api/organizations/{id}/jobs:
     get:
@@ -1596,9 +1768,11 @@ paths:
       tags: [Reports]
       summary: Queue job execution in a period, by project or organization
       description: >-
-        Jobs whose execution lies entirely within the period. Jobs that ran
-        inside a reservation are excluded — that time is billed as reserved
-        hours, and counting both would bill it twice.
+        Queue time of jobs whose execution lies entirely within the period:
+        each job's execution **outside** its project's reservations, the same
+        part billing charges. Time inside a reservation is billed as reserved
+        hours, and counting both would bill it twice. A job wholly inside a
+        reservation is not counted; `count` is the jobs with any queue time.
       parameters:
         - { $ref: '#/components/parameters/reportFrom' }
         - { $ref: '#/components/parameters/reportTo' }
@@ -1636,10 +1810,11 @@ paths:
       tags: [Reports]
       summary: How much of the reserved time was used
       description: >-
-        The jobs that ran inside a reservation, matched to their block by
-        project and containment, against the hours that block reserved.
-        `count` and `total_seconds`/`total_hours` describe those jobs, so they
-        mean the same as in the other reports.
+        For each reservation block, the execution of its project's jobs that
+        fell inside it (clipped to the block, so a job straddling an edge
+        contributes the part inside), against the hours the block reserved.
+        `count` is the jobs that ran at least partly inside; `total_seconds` /
+        `total_hours` is that inside time.
       parameters:
         - { $ref: '#/components/parameters/reportFrom' }
         - { $ref: '#/components/parameters/reportTo' }

@@ -76,6 +76,39 @@ export const getReservationsWithProject = (
   });
 };
 
+/**
+ * A project's reservations that overlap `[start, end)`, oldest first. Used to
+ * decide which part of a job's execution its reservations already paid for.
+ */
+export const getProjectReservationsOverlapping = (
+  projectId: number,
+  start: Date,
+  end: Date,
+  transaction?: Transaction,
+) =>
+  Reservation.findAll({
+    where: {
+      project_id: projectId,
+      [Op.and]: [{ start: { [Op.lt]: end } }, { end: { [Op.gt]: start } }],
+    },
+    order: [["start", "ASC"]],
+    transaction,
+  });
+
+/** Every reservation, of any project, overlapping `[start, end)`. */
+export const getReservationsOverlapping = (
+  start: Date,
+  end: Date,
+  transaction?: Transaction,
+) =>
+  Reservation.findAll({
+    where: {
+      [Op.and]: [{ start: { [Op.lt]: end } }, { end: { [Op.gt]: start } }],
+    },
+    order: [["start", "ASC"]],
+    transaction,
+  });
+
 export const isSlotAlreadyBusy = async (start: Date, end: Date, id = 0) => {
   const overlappingSlots = await Reservation.findAll({
     where: {

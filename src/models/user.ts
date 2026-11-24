@@ -24,6 +24,17 @@ export class User extends Model<
   declare organization_manager: boolean | null;
   declare organization_auditor: boolean | null;
   declare pulla_user: boolean | null;
+  /**
+   * May open a QPU session (an exclusive hold on the machine, e.g. an IQM
+   * iteration). Granted by an administrator; default off.
+   */
+  declare session_access: CreationOptional<boolean | null>;
+  /**
+   * This user's longest session, in seconds. Replaces the deployment default
+   * (the gateway's SESSION_MAX_SECONDS) when set, so it can raise it as well as
+   * lower it; null = the default.
+   */
+  declare session_max_seconds: CreationOptional<number | null>;
   declare default_project_id?: number | null; // default project
   // Populated when the Organization association is eager-loaded.
   declare organization?: Organization | null;
@@ -48,6 +59,8 @@ export const initUserModel = (sequelize: Sequelize) => {
       // grants the pulla_user role (sweep submission) to HPC/Sqed principals;
       // looked up by the QC Gateway's auth plugin
       pulla_user: { type: DataTypes.BOOLEAN, defaultValue: false },
+      session_access: { type: DataTypes.BOOLEAN, defaultValue: false },
+      session_max_seconds: { type: DataTypes.INTEGER, allowNull: true },
     },
     { sequelize, modelName: "user" },
   );
